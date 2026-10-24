@@ -1,0 +1,1312 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Courier Dispatch · Demo</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<style>
+  .leaflet-container { font: inherit; }
+  .touch-none { touch-action: none; }
+</style>
+</head>
+<body class="bg-slate-100">
+<div id="root"></div>
+
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useRef, useMemo, useCallback } = React;
+
+/* ================= Constants & helpers ================= */
+const MIN = 60000;
+const P = {
+  depot:        { name: 'Depot, Shirlington', lat: 38.844,  lng: -77.079 },
+  rosslyn:      { name: 'Rosslyn',            lat: 38.8964, lng: -77.0716 },
+  courthouse:   { name: 'Courthouse',         lat: 38.8907, lng: -77.0846 },
+  clarendon:    { name: 'Clarendon',          lat: 38.8868, lng: -77.0954 },
+  ballston:     { name: 'Ballston',           lat: 38.8822, lng: -77.1112 },
+  virginiaSq:   { name: 'Virginia Square',    lat: 38.883,  lng: -77.103 },
+  lyonVillage:  { name: 'Lyon Village',       lat: 38.8945, lng: -77.0947 },
+  cherrydale:   { name: 'Cherrydale',         lat: 38.8977, lng: -77.108 },
+  westover:     { name: 'Westover',           lat: 38.8836, lng: -77.1384 },
+  crystalCity:  { name: 'Crystal City',       lat: 38.8573, lng: -77.0505 },
+  pentagonCity: { name: 'Pentagon City',      lat: 38.8627, lng: -77.0596 },
+  columbiaPike: { name: 'Columbia Pike',      lat: 38.862,  lng: -77.088 },
+  shirlington:  { name: 'Shirlington',        lat: 38.8418, lng: -77.087 },
+  fairlington:  { name: 'Fairlington',        lat: 38.833,  lng: -77.088 },
+};
+const CLIENTS = [
+  { id: 'c1', name: 'Bean & Co Cafe', pickup: 'clarendon' },
+  { id: 'c2', name: 'Greenleaf Florist', pickup: 'shirlington' },
+  { id: 'c3', name: 'Sunrise Pharmacy', pickup: 'ballston' },
+  { id: 'c4', name: 'Harbor Grill', pickup: 'crystalCity' },
+];
+const ZONES = ['North', 'South'];
+const FAIL_REASONS = ['Nobody available', 'Wrong or missing address', 'Recipient refused', "Couldn't access building", 'Item damaged', 'Other'];
+const STOP_COLORS = { pending: '#64748b', arrived: '#2563eb', completed: '#16a34a', failed: '#dc2626' };
+const STATUS_STYLE = { available: 'bg-green-100 text-green-800', busy: 'bg-blue-100 text-blue-800', offline: 'bg-slate-200 text-slate-500' };
+const STATUS_COLOR = { available: '#16a34a', busy: '#2563eb', offline: '#94a3b8' };
+const JOB_BADGE = { unassigned: 'bg-slate-100 text-slate-700', assigned: 'bg-blue-100 text-blue-800', in_progress: 'bg-indigo-100 text-indigo-800', delivered: 'bg-green-100 text-green-800', failed: 'bg-red-100 text-red-800' };
+
+const addr = (k) => `${P[k].name}, Arlington, VA`;
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const fmtAge = (ms) => { const m = Math.floor(ms / MIN); return m < 1 ? `${Math.max(0, Math.floor(ms / 1000))}s` : m < 60 ? `${m}m` : `${Math.floor(m / 60)}h ${m % 60}m`; };
+const fmtTime = (ts) => (ts ? new Date(ts).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) : '');
+const fmtWhen = (ts) => (ts ? new Date(ts).toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }) : '');
+const tomorrow = () => { const d = new Date(); d.setDate(d.getDate() + 1); return d.toLocaleDateString('en-CA'); };
+const todayStr = () => new Date().toLocaleDateString('en-CA');
+const isStale = (d, now) => d.status !== 'offline' && now - d.lastPing > 5 * MIN;
+const initials = (n) => n.split(' ').map((x) => x[0]).join('').slice(0, 2);
+const evt = (who, text, at = Date.now()) => ({ at, who, text });
+const windowText = (job) => {
+  if (job.type === 'on_demand') return 'ASAP';
+  const day = job.scheduledDate && job.scheduledDate !== todayStr() ? `${job.scheduledDate} ` : '';
+  return job.windowStart ? `${day}${fmtTime(job.windowStart)}–${fmtTime(job.windowEnd)}` : day || 'Today';
+};
+const windowLabel = (job) => (job.type === 'on_demand' ? '⚡ ASAP' : `🕒 ${windowText(job)}`);
+const findStop = (s, stopId) => {
+  for (const j of s.jobs) for (const st of j.stops) if (st.id === stopId) return { job: j, stop: st };
+  return {};
+};
+const updJob = (s, id, fn) => ({ ...s, jobs: s.jobs.map((j) => (j.id === id ? fn(j) : j)) });
+const updDriver = (s, id, fn) => ({ ...s, drivers: s.drivers.map((d) => (d.id === id ? fn(d) : d)) });
+const hasActive = (s, driverId) => s.jobs.some((j) => j.driverId === driverId && ['assigned', 'in_progress'].includes(j.status));
+const refreshDriverStatus = (s, driverId) =>
+  updDriver(s, driverId, (d) => (d.status === 'offline' ? d : { ...d, status: hasActive(s, driverId) ? 'busy' : 'available' }));
+const sortQueue = (jobs) => [
+  ...jobs.filter((j) => j.type === 'on_demand').sort((a, b) => a.createdAt - b.createdAt),
+  ...jobs.filter((j) => j.type === 'scheduled').sort((a, b) => (a.windowStart ?? 9e15) - (b.windowStart ?? 9e15)),
+];
+const jobColor = (job, now) => {
+  if (job.type !== 'on_demand') return '#64748b';
+  const m = (now - job.createdAt) / MIN;
+  return m > 30 ? '#dc2626' : m > 15 ? '#f59e0b' : '#ea580c';
+};
+const line = (a, b, n) => Array.from({ length: n }, (_, i) => [a[0] + ((b[0] - a[0]) * i) / (n - 1), a[1] + ((b[1] - a[1]) * i) / (n - 1)]);
+
+// Simulated camera: draws a "delivery photo" with the address and timestamp
+function makePhoto(address, at = Date.now()) {
+  const c = document.createElement('canvas');
+  c.width = 640; c.height = 480;
+  const g = c.getContext('2d');
+  const grd = g.createLinearGradient(0, 0, 0, 480);
+  grd.addColorStop(0, '#cbd5e1'); grd.addColorStop(1, '#64748b');
+  g.fillStyle = grd; g.fillRect(0, 0, 640, 480);
+  g.fillStyle = '#7c4a1e'; g.fillRect(170, 90, 300, 330);
+  g.fillStyle = '#fbbf24'; g.beginPath(); g.arc(440, 270, 9, 0, Math.PI * 2); g.fill();
+  g.font = '130px serif'; g.textAlign = 'center'; g.fillText('📦', 320, 405);
+  g.fillStyle = 'rgba(0,0,0,.55)'; g.fillRect(0, 420, 640, 60);
+  g.fillStyle = '#fff'; g.font = 'bold 20px sans-serif'; g.fillText(address, 320, 446);
+  g.font = '16px sans-serif'; g.fillText(new Date(at).toLocaleString(), 320, 469);
+  return c.toDataURL('image/jpeg', 0.8);
+}
+
+function mkStop(jobId, kind, k, extra = {}) {
+  return { id: `${jobId}-${kind === 'pickup' ? 'p' : 'd'}`, kind, address: addr(k), lat: P[k].lat, lng: P[k].lng,
+    status: 'pending', arrivedAt: null, completedAt: null, failureReason: null, proof: null, ...extra };
+}
+function mkJob(o) {
+  const created = o.createdAt ?? Date.now();
+  return {
+    id: o.ref, ref: o.ref, clientName: o.clientName ?? null, recipient: o.recipient ?? '', phone: o.phone ?? '',
+    type: o.type, zone: o.zone, createdAt: created, windowStart: o.windowStart ?? null, windowEnd: o.windowEnd ?? null,
+    scheduledDate: null, status: o.status ?? 'unassigned', driverId: o.driverId ?? null, viewer: o.viewer ?? null,
+    notes: o.notes ?? '', reviewed: false,
+    stops: [mkStop(o.ref, 'pickup', o.pickup, o.pickupExtra), mkStop(o.ref, 'dropoff', o.dropoff, o.dropoffExtra)],
+    events: [evt('System', `Created (${o.source ?? 'manual'})`, created), ...(o.events ?? [])],
+  };
+}
+
+function makeInitialState() {
+  const t = Date.now();
+  const ago = (m) => t - m * MIN;
+  const ahead = (m) => t + m * MIN;
+  const jobs = [
+    mkJob({ ref: 'J-1041', clientName: 'Bean & Co Cafe', recipient: 'Front desk', type: 'scheduled', zone: 'North', createdAt: ago(42), windowStart: ago(150), windowEnd: ago(30), pickup: 'clarendon', dropoff: 'rosslyn' }),
+    mkJob({ ref: 'J-1042', recipient: 'R. Patel', phone: '(703) 555-0142', type: 'on_demand', zone: 'North', createdAt: ago(34), pickup: 'courthouse', dropoff: 'lyonVillage', viewer: 'Maria' }),
+    mkJob({ ref: 'J-1043', clientName: 'Greenleaf Florist', recipient: 'A. Chen', type: 'scheduled', zone: 'South', createdAt: ago(20), windowStart: ahead(60), windowEnd: ahead(180), pickup: 'shirlington', dropoff: 'crystalCity' }),
+    mkJob({ ref: 'J-1044', recipient: 'T. Nguyen', phone: '(703) 555-0177', type: 'on_demand', zone: 'South', createdAt: ago(18), pickup: 'columbiaPike', dropoff: 'pentagonCity' }),
+    mkJob({ ref: 'J-1045', clientName: 'Sunrise Pharmacy', recipient: 'L. Gomez', type: 'on_demand', zone: 'North', createdAt: ago(6), pickup: 'ballston', dropoff: 'cherrydale', notes: 'Leave with front desk if no answer' }),
+    mkJob({ ref: 'J-1046', recipient: 'Lakeside Dental', type: 'scheduled', zone: 'South', createdAt: ago(3), windowStart: ahead(180), windowEnd: ahead(300), pickup: 'depot', dropoff: 'fairlington' }),
+    mkJob({ ref: 'J-1030', recipient: 'City Books', type: 'scheduled', zone: 'North', createdAt: ago(90), windowStart: ago(60), windowEnd: ahead(30), pickup: 'depot', dropoff: 'ballston', status: 'in_progress', driverId: 'D1', notes: 'Gate code 4412',
+      pickupExtra: { status: 'completed', arrivedAt: ago(30), completedAt: ago(25) },
+      events: [evt('You', 'Assigned to Alex Kim', ago(40)), evt('Alex Kim', 'Arrived at pickup', ago(30)), evt('Alex Kim', 'Picked up', ago(25))] }),
+    mkJob({ ref: 'J-1033', recipient: 'M. Okafor', phone: '(571) 555-0133', type: 'on_demand', zone: 'North', createdAt: ago(22), pickup: 'virginiaSq', dropoff: 'westover', status: 'assigned', driverId: 'D1',
+      events: [evt('Sam', 'Assigned to Alex Kim', ago(15))] }),
+    mkJob({ ref: 'J-1035', clientName: 'Harbor Grill', recipient: 'Catering order', type: 'scheduled', zone: 'South', createdAt: ago(60), windowStart: ago(10), windowEnd: ahead(80), pickup: 'crystalCity', dropoff: 'pentagonCity', status: 'assigned', driverId: 'D3',
+      events: [evt('Priya', 'Assigned to Carlos Diaz', ago(20))] }),
+    mkJob({ ref: 'J-1028', clientName: 'Bean & Co Cafe', recipient: 'J. Rivera', type: 'on_demand', zone: 'North', createdAt: ago(95), pickup: 'clarendon', dropoff: 'lyonVillage', status: 'delivered', driverId: 'D2',
+      pickupExtra: { status: 'completed', arrivedAt: ago(75), completedAt: ago(70) },
+      dropoffExtra: { status: 'completed', arrivedAt: ago(50), completedAt: ago(48), proof: { photo: makePhoto(addr('lyonVillage'), ago(48)), signature: null, name: 'J. Rivera', at: ago(48) } },
+      events: [evt('You', 'Assigned to Bea Lopez', ago(85)), evt('Bea Lopez', 'Picked up', ago(70)), evt('Bea Lopez', 'Delivered', ago(48))] }),
+    mkJob({ ref: 'J-1029', clientName: 'Greenleaf Florist', recipient: 'D. Walsh', phone: '(703) 555-0129', type: 'scheduled', zone: 'South', createdAt: ago(120), pickup: 'shirlington', dropoff: 'fairlington', status: 'failed', driverId: 'D4',
+      pickupExtra: { status: 'completed', arrivedAt: ago(60), completedAt: ago(55) },
+      dropoffExtra: { status: 'failed', arrivedAt: ago(18), completedAt: ago(15), failureReason: 'Nobody available' },
+      events: [evt('You', 'Assigned to Dana Wu', ago(100)), evt('Dana Wu', 'Picked up', ago(55)), evt('Dana Wu', 'Delivery failed: Nobody available', ago(15))] }),
+  ];
+  const alexPos = [38.866, -77.094];
+  const drivers = [
+    { id: 'D1', name: 'Alex Kim', status: 'busy', zone: 'North', pos: alexPos, lastPing: t, frozen: false, trail: line([P.depot.lat, P.depot.lng], alexPos, 12), route: ['J-1030-p', 'J-1030-d', 'J-1033-p', 'J-1033-d'] },
+    { id: 'D2', name: 'Bea Lopez', status: 'available', zone: 'North', pos: [38.8935, -77.0935], lastPing: t, frozen: false, trail: [], route: ['J-1028-p', 'J-1028-d'] },
+    { id: 'D3', name: 'Carlos Diaz', status: 'busy', zone: 'South', pos: [P.columbiaPike.lat, P.columbiaPike.lng], lastPing: ago(7), frozen: true, trail: [], route: ['J-1035-p', 'J-1035-d'] },
+    { id: 'D4', name: 'Dana Wu', status: 'available', zone: 'South', pos: [38.836, -77.086], lastPing: t, frozen: false, trail: [], route: ['J-1029-p', 'J-1029-d'] },
+    { id: 'D5', name: 'Eli Brooks', status: 'offline', zone: 'North', pos: [P.virginiaSq.lat, P.virginiaSq.lng], lastPing: ago(95), frozen: false, trail: [], route: [] },
+  ];
+  return { jobs, drivers, nextRef: 1047 };
+}
+
+/* ================= Actions (mirror the real database functions) ================= */
+function makeApi({ setState, stateRef, showToast }) {
+  const removeFromRoute = (n, driverId, jobId) => updDriver(n, driverId, (d) => ({ ...d, route: d.route.filter((id) => !id.startsWith(`${jobId}-`)) }));
+  const toTs = (date, hhmm) => {
+    if (!hhmm) return null;
+    const [h, m] = hhmm.split(':');
+    const x = new Date(`${date}T00:00`);
+    x.setHours(+h, +m, 0, 0);
+    return x.getTime();
+  };
+  const SAMPLE_CSV = [
+    ['Bean & Co Cafe', 'K. Dubois', 'clarendon', 'virginiaSq', 'North'],
+    ['Bean & Co Cafe', 'S. Ortiz', 'clarendon', 'cherrydale', 'North'],
+    ['Sunrise Pharmacy', 'H. Kim', 'ballston', 'westover', 'North'],
+    ['Harbor Grill', 'Office lunch', 'crystalCity', 'pentagonCity', 'South'],
+    ['Greenleaf Florist', 'P. Shah', 'shirlington', 'fairlington', 'South'],
+  ];
+
+  return {
+    assign(jobId, driverId) {
+      const s = stateRef.current;
+      const job = s.jobs.find((j) => j.id === jobId);
+      const d = s.drivers.find((x) => x.id === driverId);
+      if (!job || !d) return false;
+      if (job.status !== 'unassigned') { showToast(`${job.ref} is already assigned`, 'warn'); return false; }
+      if (d.status === 'offline') { showToast(`${d.name} is offline`, 'warn'); return false; }
+      let target = d;
+      if (job.viewer) {
+        // Simulates another dispatcher winning the race (the real safe-assignment check)
+        target = s.drivers.find((x) => x.zone === job.zone && x.status !== 'offline' && x.id !== driverId) || d;
+        showToast(`Already assigned by ${job.viewer} to ${target.name}`, 'warn');
+      } else {
+        showToast(`${job.ref} assigned to ${d.name}`);
+      }
+      const who = job.viewer || 'You';
+      setState((prev) => {
+        let n = updJob(prev, jobId, (j) => ({ ...j, status: 'assigned', driverId: target.id, viewer: null, events: [...j.events, evt(who, `Assigned to ${target.name}`)] }));
+        n = updDriver(n, target.id, (x) => ({ ...x, route: [...x.route, `${jobId}-p`, `${jobId}-d`] }));
+        return refreshDriverStatus(n, target.id);
+      });
+      return true;
+    },
+
+    unassign(jobId) {
+      const job = stateRef.current.jobs.find((j) => j.id === jobId);
+      if (!job || job.status !== 'assigned') return showToast("Only jobs that haven't started can be unassigned", 'warn');
+      setState((prev) => {
+        let n = updJob(prev, jobId, (j) => ({ ...j, status: 'unassigned', driverId: null, events: [...j.events, evt('You', 'Returned to queue')] }));
+        n = removeFromRoute(n, job.driverId, jobId);
+        return refreshDriverStatus(n, job.driverId);
+      });
+      showToast(`${job.ref} returned to queue`);
+    },
+
+    moveStop(driverId, index, dir) {
+      const d = stateRef.current.drivers.find((x) => x.id === driverId);
+      const route = [...d.route];
+      const j = index + dir;
+      if (j < 0 || j >= route.length) return;
+      [route[index], route[j]] = [route[j], route[index]];
+      const bad = route.some((id, i) => id.endsWith('-d') && route.indexOf(`${id.slice(0, -2)}-p`) > i);
+      if (bad) return showToast('Pickup must come before its dropoff', 'warn');
+      setState((prev) => updDriver(prev, driverId, (x) => ({ ...x, route })));
+    },
+
+    setStopStatus(stopId, status, reason, proof, who) {
+      const { job, stop } = findStop(stateRef.current, stopId);
+      if (!job) return;
+      setState((prev) => {
+        const { job: pj, stop: ps } = findStop(prev, stopId);
+        const t = Date.now();
+        let stops = pj.stops.map((st) => st.id === stopId ? {
+          ...st, status,
+          arrivedAt: status === 'arrived' ? t : st.arrivedAt,
+          completedAt: ['completed', 'failed'].includes(status) ? t : st.completedAt,
+          failureReason: reason ?? null,
+          proof: proof ?? st.proof,
+        } : st);
+        let jobStatus = pj.status;
+        const events = [...pj.events];
+        if (status === 'arrived') events.push(evt(who, `Arrived at ${ps.kind}`));
+        if (status === 'completed') {
+          events.push(evt(who, ps.kind === 'pickup' ? 'Picked up' : 'Delivered'));
+          jobStatus = ps.kind === 'pickup' ? 'in_progress' : 'delivered';
+        }
+        if (status === 'failed') {
+          stops = stops.map((st) => st.id !== stopId && ['pending', 'arrived'].includes(st.status)
+            ? { ...st, status: 'failed', completedAt: t, failureReason: reason } : st);
+          jobStatus = 'failed';
+          events.push(evt(who, `${ps.kind === 'pickup' ? 'Pickup' : 'Delivery'} failed: ${reason}`));
+        }
+        const n = updJob(prev, pj.id, (j) => ({ ...j, stops, status: jobStatus, reviewed: status === 'failed' ? false : j.reviewed, events }));
+        return pj.driverId ? refreshDriverStatus(n, pj.driverId) : n;
+      });
+      if (status === 'failed') showToast(`${job.ref}: ${stop.kind === 'pickup' ? 'pickup' : 'delivery'} failed (${reason})`, 'warn');
+      if (status === 'completed' && stop.kind === 'dropoff') showToast(`${job.ref} delivered by ${who}`);
+    },
+
+    createJob(d) {
+      const ref = `J-${stateRef.current.nextRef}`;
+      const today = todayStr();
+      setState((prev) => ({
+        ...prev,
+        nextRef: prev.nextRef + 1,
+        jobs: [...prev.jobs, mkJob({
+          ref, clientName: d.clientName, recipient: d.recipient, phone: d.phone, type: d.type, zone: d.zone,
+          windowStart: d.type === 'scheduled' ? toTs(today, d.ws) : null,
+          windowEnd: d.type === 'scheduled' ? toTs(today, d.we) : null,
+          pickup: d.pickup, dropoff: d.dropoff, notes: d.notes,
+        })],
+      }));
+      showToast(`${ref} created`);
+      return ref;
+    },
+
+    importSample() {
+      const start = stateRef.current.nextRef;
+      const today = todayStr();
+      setState((prev) => ({
+        ...prev,
+        nextRef: prev.nextRef + SAMPLE_CSV.length,
+        jobs: [...prev.jobs, ...SAMPLE_CSV.map(([client, recipient, pickup, dropoff, zone], i) => mkJob({
+          ref: `J-${start + i}`, clientName: client, recipient, type: 'scheduled', zone,
+          windowStart: toTs(today, `${13 + (i % 3)}:00`), windowEnd: toTs(today, `${15 + (i % 3)}:00`),
+          pickup, dropoff, source: 'csv',
+        }))],
+      }));
+      showToast(`Imported ${SAMPLE_CSV.length} jobs from sample-orders.csv`);
+    },
+
+    reschedule(jobId, date, note) {
+      const job = stateRef.current.jobs.find((j) => j.id === jobId);
+      if (!job || job.status !== 'failed') return;
+      const shift = (ts) => {
+        if (!ts) return null;
+        const o = new Date(ts);
+        const x = new Date(`${date}T00:00`);
+        x.setHours(o.getHours(), o.getMinutes(), 0, 0);
+        return x.getTime();
+      };
+      setState((prev) => {
+        let n = updJob(prev, jobId, (j) => ({
+          ...j, status: 'unassigned', type: 'scheduled', scheduledDate: date,
+          windowStart: shift(j.windowStart), windowEnd: shift(j.windowEnd), driverId: null, reviewed: false,
+          stops: j.stops.map((s) => ({ ...s, status: 'pending', arrivedAt: null, completedAt: null, failureReason: null })),
+          events: [...j.events, evt('You', `Rescheduled to ${date}${note ? `: "${note}"` : ''}`)],
+        }));
+        if (job.driverId) n = refreshDriverStatus(removeFromRoute(n, job.driverId, jobId), job.driverId);
+        return n;
+      });
+      showToast(`${job.ref} rescheduled to ${date}`);
+    },
+
+    closeJob(jobId, note) {
+      setState((prev) => updJob(prev, jobId, (j) => ({ ...j, reviewed: true, events: [...j.events, evt('You', `Closed: "${note}"`)] })));
+      showToast('Job closed');
+    },
+
+    addNote(jobId, note) {
+      setState((prev) => updJob(prev, jobId, (j) => ({ ...j, events: [...j.events, evt('You', `Note: "${note}"`)] })));
+      showToast('Note added');
+    },
+
+    clockIn(driverId) {
+      const d = stateRef.current.drivers.find((x) => x.id === driverId);
+      setState((prev) => updDriver(prev, driverId, (x) => ({
+        ...x, status: hasActive(prev, driverId) ? 'busy' : 'available', frozen: false, lastPing: Date.now(),
+      })));
+      showToast(`${d.name} clocked in`);
+    },
+
+    clockOut(driverId) {
+      const d = stateRef.current.drivers.find((x) => x.id === driverId);
+      setState((prev) => updDriver(prev, driverId, (x) => ({ ...x, status: 'offline' })));
+      showToast(`${d.name} clocked out`);
+    },
+  };
+}
+
+/* ================= App shell ================= */
+function App() {
+  const [state, setState] = useState(makeInitialState);
+  const stateRef = useRef(state);
+  stateRef.current = state;
+  const [tab, setTab] = useState('board');
+  const [selectedDriverId, setSelectedDriverId] = useState('D1');
+  const [selectedJobId, setSelectedJobId] = useState(null);
+  const [phoneDriverId, setPhoneDriverId] = useState('D1');
+  const [toast, setToast] = useState(null);
+  const [now, setNow] = useState(Date.now());
+  const toastTimer = useRef(null);
+
+  const showToast = useCallback((msg, kind = 'ok') => {
+    clearTimeout(toastTimer.current);
+    setToast({ msg, kind });
+    toastTimer.current = setTimeout(() => setToast(null), 3500);
+  }, []);
+
+  const api = useMemo(() => makeApi({ setState, stateRef, showToast }), [showToast]);
+
+  useEffect(() => {
+    const t = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(t);
+  }, []);
+
+  // Simulated GPS: on-shift drivers drift toward their next stop every 3 seconds
+  useEffect(() => {
+    const t = setInterval(() => {
+      setState((prev) => ({
+        ...prev,
+        drivers: prev.drivers.map((d) => {
+          if (d.status === 'offline' || d.frozen) return d;
+          const next = d.route.map((id) => findStop(prev, id).stop).find((s) => s && ['pending', 'arrived'].includes(s.status));
+          if (!next || next.status === 'arrived') return { ...d, lastPing: Date.now() };
+          const k = 0.06;
+          const pos = [d.pos[0] + (next.lat - d.pos[0]) * k, d.pos[1] + (next.lng - d.pos[1]) * k];
+          return { ...d, pos, lastPing: Date.now(), trail: [...d.trail, pos].slice(-300) };
+        }),
+      }));
+    }, 3000);
+    return () => clearInterval(t);
+  }, []);
+
+  const TABS = [
+    ['board', '🖥 Dispatch board'],
+    ['map', '🗺 Live map'],
+    ['driver', '📱 Driver app'],
+    ['split', '🖥 + 📱 Board & driver side by side'],
+  ];
+
+  const boardProps = { state, now, api, selectedDriverId, setSelectedDriverId, selectedJobId, setSelectedJobId, onOpenMap: () => setTab('map') };
+  const driverProps = { state, api, now, driverId: phoneDriverId, setDriverId: setPhoneDriverId };
+
+  return (
+    <div className="h-screen flex flex-col">
+      <div className="bg-amber-100 text-amber-900 text-xs px-4 py-1">
+        <b>Demo mode:</b> sample data around Arlington, VA. GPS is simulated and nothing is saved, so reload the page to reset.
+      </div>
+      <div className="flex flex-wrap gap-1 bg-slate-800 px-2 pt-2">
+        {TABS.map(([key, label]) => (
+          <button
+            key={key}
+            onClick={() => setTab(key)}
+            className={`px-4 py-2 rounded-t text-sm font-medium ${tab === key ? 'bg-slate-100 text-slate-900' : 'text-slate-300 hover:text-white'}`}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+
+      <div className="flex-1 min-h-0">
+        {tab === 'board' && <Board {...boardProps} active />}
+        {tab === 'map' && (
+          <LiveMap state={state} now={now} selectedDriverId={selectedDriverId} selectedJobId={selectedJobId}
+            onSelectDriver={setSelectedDriverId} onSelectJob={setSelectedJobId} />
+        )}
+        {tab === 'driver' && (
+          <div className="h-full overflow-auto flex justify-center items-start py-6">
+            <DriverApp {...driverProps} />
+          </div>
+        )}
+        {tab === 'split' && (
+          <div className="h-full flex">
+            <div className="flex-1 min-w-0"><Board {...boardProps} active /></div>
+            <div className="w-[420px] shrink-0 border-l bg-slate-200 overflow-auto flex justify-center py-4">
+              <DriverApp {...driverProps} />
+            </div>
+          </div>
+        )}
+      </div>
+
+      {toast && (
+        <div className={`fixed bottom-4 left-1/2 -translate-x-1/2 px-4 py-2 rounded shadow-lg text-white text-sm z-[2000] ${toast.kind === 'warn' ? 'bg-amber-600' : 'bg-slate-800'}`}>
+          {toast.msg}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ================= Monitor 1: Dispatch board ================= */
+function Board({ state, now, api, selectedDriverId, setSelectedDriverId, selectedJobId, setSelectedJobId, active, onOpenMap }) {
+  const [zone, setZone] = useState('all');
+  const [search, setSearch] = useState('');
+  const [leftTab, setLeftTab] = useState('queue');
+  const [showNewJob, setShowNewJob] = useState(false);
+  const [detailJobId, setDetailJobId] = useState(null);
+
+  const inZone = (x) => zone === 'all' || x.zone === zone;
+  const q = search.trim().toLowerCase();
+  const matches = (j) => !q || [j.ref, j.recipient, j.clientName, ...j.stops.map((s) => s.address)].some((v) => v && v.toLowerCase().includes(q));
+
+  const queue = sortQueue(state.jobs.filter((j) => j.status === 'unassigned' && inZone(j) && matches(j)));
+  const attention = state.jobs.filter((j) => j.status === 'failed' && !j.reviewed && inZone(j) && matches(j));
+  const delivered = state.jobs
+    .filter((j) => j.status === 'delivered' && inZone(j) && matches(j))
+    .sort((a, b) => b.stops[1].completedAt - a.stops[1].completedAt);
+  const drivers = state.drivers.filter(inZone);
+  const selDriver = state.drivers.find((d) => d.id === selectedDriverId);
+  const routeStops = selDriver ? selDriver.route.map((id) => findStop(state, id)).filter((x) => x.stop) : [];
+  const detailJob = state.jobs.find((j) => j.id === detailJobId);
+
+  const alertCount =
+    attention.length +
+    state.jobs.filter((j) => inZone(j) && j.status === 'unassigned' && j.type === 'on_demand' && now - j.createdAt > 30 * MIN).length +
+    drivers.filter((d) => isStale(d, now)).length;
+
+  const assign = (jobId, driverId) => {
+    if (jobId && driverId && api.assign(jobId, driverId)) setSelectedJobId(null);
+  };
+
+  useEffect(() => {
+    if (!active || showNewJob || detailJobId) return;
+    const onKey = (e) => {
+      if (['INPUT', 'SELECT', 'TEXTAREA'].includes(e.target.tagName)) return;
+      const idx = queue.findIndex((j) => j.id === selectedJobId);
+      if (e.key === 'ArrowDown') { e.preventDefault(); const n = queue[Math.min(idx + 1, queue.length - 1)]; if (n) setSelectedJobId(n.id); }
+      if (e.key === 'ArrowUp') { e.preventDefault(); const p = queue[Math.max(idx - 1, 0)]; if (p) setSelectedJobId(p.id); }
+      if (e.key.toLowerCase() === 'a' && selectedJobId && selectedDriverId) assign(selectedJobId, selectedDriverId);
+      if (e.key.toLowerCase() === 'n') { e.preventDefault(); setShowNewJob(true); }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  });
+
+  const cardColor = (job) => {
+    if (job.type !== 'on_demand') return 'border-slate-200 bg-white';
+    const m = (now - job.createdAt) / MIN;
+    return m > 30 ? 'border-red-500 bg-red-50' : m > 15 ? 'border-amber-400 bg-amber-50' : 'border-slate-200 bg-white';
+  };
+  const tabBtn = (key) => `px-2 py-1 -mb-px border-b-2 text-xs font-medium ${leftTab === key ? 'border-blue-600 text-blue-700' : 'border-transparent text-slate-500'}`;
+
+  return (
+    <div className="h-full flex flex-col text-sm text-slate-800">
+      {/* Top bar */}
+      <div className="flex flex-wrap items-center gap-2 bg-slate-900 text-white px-4 py-2">
+        <span className="font-semibold">Dispatch</span>
+        <span className="text-slate-400">{new Date(now).toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' })}</span>
+        <select value={zone} onChange={(e) => setZone(e.target.value)} className="bg-slate-800 rounded px-2 py-1">
+          <option value="all">All zones</option>
+          {ZONES.map((z) => <option key={z} value={z}>{z}</option>)}
+        </select>
+        <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search jobs…" className="bg-slate-800 rounded px-2 py-1 w-40" />
+        <button onClick={() => setShowNewJob(true)} className="bg-blue-600 rounded px-3 py-1">+ New job</button>
+        <button onClick={api.importSample} className="bg-slate-700 rounded px-3 py-1">Upload CSV (sample)</button>
+        <button onClick={onOpenMap} className="bg-slate-700 rounded px-3 py-1">🗺 Map</button>
+        {alertCount > 0 && <span className="bg-red-600 rounded-full px-2 py-0.5 text-xs">{alertCount} alerts</span>}
+        <div className="ml-auto flex -space-x-2">
+          {['You', 'Maria', 'Sam', 'Priya'].map((n, i) => (
+            <div key={n} title={n} className={`w-7 h-7 rounded-full border-2 border-slate-900 flex items-center justify-center text-xs ${i === 0 ? 'bg-blue-500' : 'bg-indigo-500'}`}>{n[0]}</div>
+          ))}
+        </div>
+      </div>
+
+      <div className="flex-1 min-h-0 grid grid-cols-1 lg:grid-cols-3 gap-3 p-3 overflow-auto lg:overflow-hidden">
+        {/* Left: queue / attention / delivered */}
+        <div className="bg-white rounded-lg shadow p-3 flex flex-col min-h-0">
+          <div className="flex gap-1 mb-2 border-b">
+            <button onClick={() => setLeftTab('queue')} className={tabBtn('queue')}>Unassigned ({queue.length})</button>
+            <button onClick={() => setLeftTab('attention')} className={tabBtn('attention')}>
+              Needs attention {attention.length > 0 && <span className="ml-1 rounded-full bg-red-600 text-white px-1.5">{attention.length}</span>}
+            </button>
+            <button onClick={() => setLeftTab('delivered')} className={tabBtn('delivered')}>Delivered today ({delivered.length})</button>
+          </div>
+
+          <div className="space-y-2 overflow-auto flex-1 min-h-0">
+            {leftTab === 'queue' && (
+              <>
+                {queue.map((job) => (
+                  <div
+                    key={job.id}
+                    draggable
+                    onDragStart={(e) => e.dataTransfer.setData('jobId', job.id)}
+                    onClick={() => setSelectedJobId(job.id)}
+                    className={`border-2 rounded p-2 cursor-grab ${cardColor(job)} ${selectedJobId === job.id ? 'ring-2 ring-blue-500' : ''}`}
+                  >
+                    <div className="flex justify-between">
+                      <span className="font-medium">{job.ref} · {job.clientName ?? job.recipient}</span>
+                      <span className="flex items-center gap-2">
+                        {job.type === 'on_demand' && <span className="text-xs font-mono">{fmtAge(now - job.createdAt)}</span>}
+                        <button onClick={(e) => { e.stopPropagation(); setDetailJobId(job.id); }} title="Details" className="text-slate-400 hover:text-blue-600">ⓘ</button>
+                      </span>
+                    </div>
+                    <div className="text-slate-600">{job.stops[0].address.replace(', Arlington, VA', '')} → {job.stops[1].address.replace(', Arlington, VA', '')}</div>
+                    <div className="flex justify-between text-xs mt-1">
+                      <span>{windowLabel(job)} · {job.zone}</span>
+                      {job.viewer && <span className="text-indigo-600">👁 {job.viewer} viewing</span>}
+                    </div>
+                  </div>
+                ))}
+                {queue.length === 0 && <p className="text-slate-400">Queue is clear 🎉</p>}
+              </>
+            )}
+
+            {leftTab === 'attention' && (
+              <>
+                {attention.map((job) => {
+                  const failed = job.stops.find((s) => s.status === 'failed');
+                  return (
+                    <div key={job.id} onClick={() => setDetailJobId(job.id)} className="border-2 border-red-300 bg-red-50 rounded p-2 cursor-pointer hover:border-red-500">
+                      <div className="flex justify-between">
+                        <span className="font-medium">{job.ref} · {job.clientName ?? job.recipient}</span>
+                        <span className="text-xs text-slate-500">{fmtTime(failed?.completedAt)}</span>
+                      </div>
+                      <div className="text-red-700">✕ {failed?.kind === 'pickup' ? 'Pickup' : 'Delivery'} failed: {failed?.failureReason}</div>
+                      <div className="text-xs text-slate-600 mt-1">{failed?.address} · {state.drivers.find((d) => d.id === job.driverId)?.name ?? 'No driver'}</div>
+                    </div>
+                  );
+                })}
+                {attention.length === 0 && <p className="text-slate-400">Nothing needs attention 👍</p>}
+              </>
+            )}
+
+            {leftTab === 'delivered' && (
+              <>
+                {delivered.map((job) => {
+                  const d = job.stops[1];
+                  return (
+                    <div key={job.id} onClick={() => setDetailJobId(job.id)} className="border rounded p-2 cursor-pointer hover:border-blue-400">
+                      <div className="flex justify-between">
+                        <span className="font-medium">{job.ref} · {job.clientName ?? job.recipient}</span>
+                        <span className="text-xs text-slate-500">{fmtTime(d.completedAt)}</span>
+                      </div>
+                      <div className="text-slate-600">{d.address}</div>
+                      <div className="text-xs text-slate-500 mt-1">
+                        {state.drivers.find((x) => x.id === job.driverId)?.name}
+                        {d.proof ? <> · {d.proof.photo && '📷'}{d.proof.signature && ' ✍️'}{d.proof.name && ` · ${d.proof.name}`}</> : <span className="text-amber-700"> · no proof</span>}
+                      </div>
+                    </div>
+                  );
+                })}
+                {delivered.length === 0 && <p className="text-slate-400">No deliveries yet today</p>}
+              </>
+            )}
+          </div>
+          {leftTab === 'queue' && <p className="text-xs text-slate-400 pt-2">↑/↓ select · A assign to selected driver · N new job · drag onto a driver</p>}
+        </div>
+
+        {/* Middle: drivers */}
+        <div className="bg-white rounded-lg shadow p-3 flex flex-col min-h-0">
+          <h2 className="font-semibold mb-2">Drivers ({drivers.length})</h2>
+          <div className="space-y-2 overflow-auto flex-1 min-h-0">
+            {drivers.map((d) => {
+              const stale = isStale(d, now);
+              const next = d.route.map((id) => findStop(state, id).stop).find((s) => s && ['pending', 'arrived'].includes(s.status));
+              const count = state.jobs.filter((j) => j.driverId === d.id && ['assigned', 'in_progress'].includes(j.status)).length;
+              return (
+                <div
+                  key={d.id}
+                  onClick={() => setSelectedDriverId(d.id)}
+                  onDragOver={(e) => e.preventDefault()}
+                  onDrop={(e) => assign(e.dataTransfer.getData('jobId'), d.id)}
+                  className={`border rounded p-2 cursor-pointer ${selectedDriverId === d.id ? 'border-blue-500 bg-blue-50' : 'border-slate-200'}`}
+                >
+                  <div className="flex justify-between items-center">
+                    <span className="font-medium">{d.name}</span>
+                    <span className={`text-xs rounded px-2 py-0.5 ${STATUS_STYLE[d.status]}`}>{d.status}</span>
+                  </div>
+                  <div className="text-xs text-slate-600 mt-1">{next ? `Next: ${next.address.replace(', Arlington, VA', '')}` : 'No pending stops'} · {count} jobs · {d.zone}</div>
+                  <div className={`text-xs mt-1 ${stale ? 'text-red-600 font-medium' : 'text-slate-400'}`}>{stale && '⚠ '}GPS {fmtAge(now - d.lastPing)} ago</div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+
+        {/* Right: route panel */}
+        <div
+          className="bg-white rounded-lg shadow p-3 flex flex-col min-h-0"
+          onDragOver={(e) => e.preventDefault()}
+          onDrop={(e) => assign(e.dataTransfer.getData('jobId'), selectedDriverId)}
+        >
+          <h2 className="font-semibold mb-2">Today's route · {selDriver?.name ?? 'Select a driver'}</h2>
+          {selDriver && routeStops.length === 0 && <div className="border-2 border-dashed rounded p-6 text-center text-slate-400">Drop jobs here to assign</div>}
+          <ol className="space-y-2 overflow-auto flex-1 min-h-0">
+            {routeStops.map(({ stop: s, job }, i) => (
+              <li key={s.id} className="border rounded p-2 flex gap-2">
+                <span className="w-6 h-6 rounded-full text-white flex items-center justify-center text-xs shrink-0" style={{ background: STOP_COLORS[s.status] }}>
+                  {s.status === 'completed' ? '✓' : s.status === 'failed' ? '✕' : i + 1}
+                </span>
+                <div className="flex-1">
+                  <div className="font-medium">
+                    {s.kind === 'pickup' ? '↑ Pickup' : '↓ Dropoff'} · <button onClick={() => setDetailJobId(job.id)} className="text-blue-600 hover:underline">{job.ref}</button>
+                  </div>
+                  <div className="text-xs text-slate-600">{s.address}</div>
+                  <div className="text-xs" style={{ color: STOP_COLORS[s.status] }}>{s.status}</div>
+                </div>
+                <div className="flex flex-col text-xs">
+                  <button onClick={() => api.moveStop(selDriver.id, i, -1)} className="px-1 hover:bg-slate-100">▲</button>
+                  <button onClick={() => api.moveStop(selDriver.id, i, 1)} className="px-1 hover:bg-slate-100">▼</button>
+                </div>
+                {job.status === 'assigned' && <button onClick={() => api.unassign(job.id)} title="Return to queue" className="text-xs text-red-600 self-start">✕</button>}
+              </li>
+            ))}
+          </ol>
+        </div>
+      </div>
+
+      {showNewJob && <NewJobModal onClose={() => setShowNewJob(false)} onCreate={api.createJob} />}
+      {detailJob && <JobDetail job={detailJob} drivers={state.drivers} api={api} onClose={() => setDetailJobId(null)} />}
+    </div>
+  );
+}
+
+/* ================= New job form ================= */
+function NewJobModal({ onClose, onCreate }) {
+  const [type, setType] = useState('on_demand');
+  const [clientId, setClientId] = useState('');
+  const [pickup, setPickup] = useState('');
+  const [dropoff, setDropoff] = useState('');
+  const [recipient, setRecipient] = useState('');
+  const [phone, setPhone] = useState('');
+  const [ws, setWs] = useState('');
+  const [we, setWe] = useState('');
+  const [zone, setZone] = useState('North');
+  const [notes, setNotes] = useState('');
+  const [error, setError] = useState('');
+
+  useEffect(() => {
+    const k = (e) => e.key === 'Escape' && onClose();
+    window.addEventListener('keydown', k);
+    return () => window.removeEventListener('keydown', k);
+  }, [onClose]);
+
+  const pickClient = (id) => {
+    setClientId(id);
+    const c = CLIENTS.find((x) => x.id === id);
+    if (c) setPickup(c.pickup);
+  };
+
+  const submit = (e) => {
+    e.preventDefault();
+    if (!pickup || !dropoff) return setError('Choose a pickup and a dropoff location.');
+    if (pickup === dropoff) return setError('Pickup and dropoff are the same place.');
+    if (type === 'scheduled' && Boolean(ws) !== Boolean(we)) return setError('Enter both window times, or neither.');
+    if (type === 'scheduled' && ws && we <= ws) return setError('Window end must be after start.');
+    onCreate({ type, clientName: CLIENTS.find((c) => c.id === clientId)?.name ?? null, recipient, phone, pickup, dropoff, ws, we, zone, notes });
+    onClose();
+  };
+
+  const field = 'w-full border border-slate-300 rounded px-3 py-2';
+  const lbl = 'block text-xs font-medium text-slate-600 mb-1';
+  const placeOptions = Object.entries(P).map(([k, v]) => <option key={k} value={k}>{v.name}</option>);
+
+  return (
+    <div className="fixed inset-0 z-50 bg-black/40 flex items-center justify-center p-4" onMouseDown={onClose}>
+      <form onMouseDown={(e) => e.stopPropagation()} onSubmit={submit} className="bg-white rounded-lg shadow-xl w-full max-w-lg p-5 space-y-3 text-sm">
+        <div className="flex justify-between items-center">
+          <h2 className="text-lg font-semibold">New job</h2>
+          <button type="button" onClick={onClose} className="text-slate-400 hover:text-slate-700">✕</button>
+        </div>
+        <div className="flex rounded border overflow-hidden">
+          {[['on_demand', '⚡ On-demand'], ['scheduled', '🕒 Scheduled']].map(([v, l]) => (
+            <button key={v} type="button" onClick={() => setType(v)} className={`flex-1 py-2 ${type === v ? 'bg-blue-600 text-white' : 'bg-white text-slate-600'}`}>{l}</button>
+          ))}
+        </div>
+        <div className="grid grid-cols-2 gap-3">
+          <div><label className={lbl}>Client</label>
+            <select value={clientId} onChange={(e) => pickClient(e.target.value)} className={field}>
+              <option value="">No client / one-off</option>
+              {CLIENTS.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
+            </select>
+          </div>
+          <div><label className={lbl}>Zone</label>
+            <select value={zone} onChange={(e) => setZone(e.target.value)} className={field}>{ZONES.map((z) => <option key={z}>{z}</option>)}</select>
+          </div>
+          <div><label className={lbl}>Pickup {clientId && <span className="text-green-600">(client default)</span>}</label>
+            <select value={pickup} onChange={(e) => setPickup(e.target.value)} className={field}><option value="">Choose…</option>{placeOptions}</select>
+          </div>
+          <div><label className={lbl}>Dropoff</label>
+            <select value={dropoff} onChange={(e) => setDropoff(e.target.value)} className={field}><option value="">Choose…</option>{placeOptions}</select>
+          </div>
+          <div><label className={lbl}>Recipient name</label><input value={recipient} onChange={(e) => setRecipient(e.target.value)} className={field} /></div>
+          <div><label className={lbl}>Recipient phone</label><input value={phone} onChange={(e) => setPhone(e.target.value)} className={field} /></div>
+          {type === 'scheduled' && (
+            <>
+              <div><label className={lbl}>Window start (today)</label><input type="time" value={ws} onChange={(e) => setWs(e.target.value)} className={field} /></div>
+              <div><label className={lbl}>Window end</label><input type="time" value={we} onChange={(e) => setWe(e.target.value)} className={field} /></div>
+            </>
+          )}
+        </div>
+        <div><label className={lbl}>Notes for driver</label><textarea rows={2} value={notes} onChange={(e) => setNotes(e.target.value)} placeholder="Gate code, leave at front desk…" className={field} /></div>
+        <p className="text-xs text-slate-500">In the real app these are address fields with Mapbox autocomplete; the demo uses preset Arlington locations.</p>
+        {error && <p className="text-red-600">{error}</p>}
+        <div className="flex justify-end gap-2">
+          <button type="button" onClick={onClose} className="px-4 py-2 rounded border">Cancel</button>
+          <button type="submit" className="px-4 py-2 rounded bg-blue-600 text-white">Create job</button>
+        </div>
+      </form>
+    </div>
+  );
+}
+
+/* ================= Job detail panel ================= */
+function JobDetail({ job, drivers, api, onClose }) {
+  const [note, setNote] = useState('');
+  const [date, setDate] = useState(tomorrow());
+  const [rNote, setRNote] = useState('');
+  const [cNote, setCNote] = useState('');
+  const [zoom, setZoom] = useState(null);
+
+  useEffect(() => {
+    const k = (e) => { if (e.key === 'Escape') (zoom ? setZoom(null) : onClose()); };
+    window.addEventListener('keydown', k);
+    return () => window.removeEventListener('keydown', k);
+  }, [zoom, onClose]);
+
+  const needs = job.status === 'failed' && !job.reviewed;
+  const failed = job.stops.find((s) => s.status === 'failed');
+  const driverName = drivers.find((d) => d.id === job.driverId)?.name;
+  const field = 'w-full border border-slate-300 rounded px-2 py-1.5';
+
+  return (
+    <div className="fixed inset-0 z-50 bg-black/40 flex items-center justify-center p-4" onMouseDown={onClose}>
+      <div onMouseDown={(e) => e.stopPropagation()} className="bg-white rounded-lg shadow-xl w-full max-w-4xl max-h-[90vh] flex flex-col text-sm">
+        <div className="flex justify-between items-center px-5 py-3 border-b">
+          <div className="flex items-center gap-3">
+            <h2 className="text-lg font-semibold">{job.ref}</h2>
+            <span className={`rounded px-2 py-0.5 text-xs ${JOB_BADGE[job.status]}`}>{job.status.replace('_', ' ')}{job.status === 'failed' && job.reviewed ? ' · closed' : ''}</span>
+            <span className="text-slate-500">{job.clientName ?? job.recipient}</span>
+          </div>
+          <button onClick={onClose} className="text-slate-400 hover:text-slate-700">✕</button>
+        </div>
+
+        <div className="grid grid-cols-1 md:grid-cols-5 gap-5 p-5 overflow-auto">
+          <div className="md:col-span-3 space-y-4">
+            <div className="text-slate-600 space-y-0.5">
+              {job.recipient && <div>Recipient: {job.recipient}</div>}
+              {job.phone && <div>Phone: {job.phone}</div>}
+              <div>{job.type === 'on_demand' ? 'On-demand' : `Scheduled · ${windowText(job)}`} · {job.zone}</div>
+              {driverName && <div>Driver: {driverName}</div>}
+              {job.notes && <div className="bg-yellow-50 border border-yellow-200 rounded p-2 mt-2">📝 {job.notes}</div>}
+            </div>
+
+            {job.stops.map((s) => (
+              <div key={s.id} className="border rounded p-3 space-y-2">
+                <div className="flex justify-between">
+                  <span className="font-medium">{s.kind === 'pickup' ? '↑ Pickup' : '↓ Dropoff'}: {s.address}</span>
+                  <span className="text-xs font-medium" style={{ color: STOP_COLORS[s.status] }}>{s.status}</span>
+                </div>
+                <div className="text-xs text-slate-500">
+                  {s.arrivedAt && `Arrived ${fmtWhen(s.arrivedAt)}`}{s.arrivedAt && s.completedAt && ' · '}
+                  {s.completedAt && `${s.status === 'failed' ? 'Failed' : 'Completed'} ${fmtWhen(s.completedAt)}`}
+                </div>
+                {s.failureReason && <div className="text-red-600">✕ {s.failureReason}</div>}
+                {s.proof && (
+                  <div className="flex gap-3 items-start bg-slate-50 rounded p-2">
+                    {s.proof.photo && <img src={s.proof.photo} onClick={() => setZoom(s.proof.photo)} className="w-32 h-24 object-cover rounded cursor-zoom-in" />}
+                    <div className="space-y-1">
+                      {s.proof.signature && <img src={s.proof.signature} onClick={() => setZoom(s.proof.signature)} className="h-14 bg-white border rounded cursor-zoom-in" />}
+                      {s.proof.name && <div>Received by {s.proof.name}</div>}
+                      <div className="text-xs text-slate-500">Captured {fmtWhen(s.proof.at)}</div>
+                    </div>
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+
+          <div className="md:col-span-2 space-y-4">
+            {needs && (
+              <div className="border-2 border-red-300 bg-red-50 rounded p-3 space-y-3">
+                <div className="font-semibold text-red-700">Needs attention</div>
+                <div className="text-red-700">{failed?.kind === 'pickup' ? 'Pickup' : 'Delivery'} failed: {failed?.failureReason}</div>
+                <div className="space-y-2">
+                  <div className="font-medium">Reschedule</div>
+                  <input type="date" min={todayStr()} value={date} onChange={(e) => setDate(e.target.value)} className={field} />
+                  <input value={rNote} onChange={(e) => setRNote(e.target.value)} placeholder="Note (optional)" className={field} />
+                  <button onClick={() => api.reschedule(job.id, date, rNote.trim())} className="w-full bg-blue-600 text-white rounded py-2">Reschedule</button>
+                </div>
+                <div className="space-y-2 pt-2 border-t border-red-200">
+                  <div className="font-medium">Or close without retrying</div>
+                  <textarea rows={2} value={cNote} onChange={(e) => setCNote(e.target.value)} placeholder="Why? e.g. refused, client notified" className={field} />
+                  <button disabled={!cNote.trim()} onClick={() => { api.closeJob(job.id, cNote.trim()); setCNote(''); }} className="w-full border border-slate-400 rounded py-2 disabled:opacity-50">Close with note</button>
+                </div>
+              </div>
+            )}
+
+            <div className="space-y-2">
+              <div className="font-medium">Add a note for the record</div>
+              <textarea rows={2} value={note} onChange={(e) => setNote(e.target.value)} placeholder="e.g. Called client, confirmed new address" className={field} />
+              <button disabled={!note.trim()} onClick={() => { api.addNote(job.id, note.trim()); setNote(''); }} className="w-full border border-blue-600 text-blue-600 rounded py-2 disabled:opacity-50">Add note</button>
+            </div>
+
+            <div>
+              <div className="font-medium mb-2">History</div>
+              <ol className="space-y-2 border-l-2 border-slate-200 pl-3">
+                {job.events.map((e, i) => (
+                  <li key={i}>
+                    <div className={e.text.includes('failed') ? 'text-red-600' : e.text.startsWith('Note') ? 'italic' : ''}>{e.text}</div>
+                    <div className="text-xs text-slate-400">{fmtWhen(e.at)} · {e.who}</div>
+                  </li>
+                ))}
+              </ol>
+            </div>
+          </div>
+        </div>
+      </div>
+      {zoom && (
+        <div className="fixed inset-0 z-[70] bg-black/80 flex items-center justify-center p-8 cursor-zoom-out" onMouseDown={(e) => { e.stopPropagation(); setZoom(null); }}>
+          <img src={zoom} className="max-h-full max-w-full rounded bg-white" />
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ================= Monitor 2: Live map ================= */
+const driverIcon = (d, sel, stale) => L.divIcon({
+  className: '', iconSize: [32, 32], iconAnchor: [16, 16],
+  html: `<div style="width:32px;height:32px;border-radius:50%;background:${STATUS_COLOR[d.status]};color:#fff;font:600 11px system-ui;display:flex;align-items:center;justify-content:center;border:3px ${stale ? 'dashed #dc2626' : 'solid #fff'};box-shadow:0 0 0 ${sel ? 4 : 0}px rgba(37,99,235,.5),0 1px 4px rgba(0,0,0,.4)">${initials(d.name)}</div>`,
+});
+const jobIcon = (color, sel) => L.divIcon({
+  className: '', iconSize: [18, 18], iconAnchor: [9, 9],
+  html: `<div style="width:16px;height:16px;background:${color};transform:rotate(45deg);border:2px solid #fff;box-shadow:0 0 0 ${sel ? 3 : 0}px #2563eb,0 1px 3px rgba(0,0,0,.4)"></div>`,
+});
+const stopIcon = (label, status) => L.divIcon({
+  className: '', iconSize: [22, 22], iconAnchor: [11, 11],
+  html: `<div style="width:22px;height:22px;border-radius:50%;background:${status === 'pending' ? '#0f172a' : STOP_COLORS[status]};color:#fff;font:600 11px system-ui;display:flex;align-items:center;justify-content:center;border:2px solid #fff">${label}</div>`,
+});
+
+function LiveMap({ state, now, selectedDriverId, selectedJobId, onSelectDriver, onSelectJob }) {
+  const elRef = useRef(null);
+  const mapRef = useRef(null);
+  const lay = useRef(null);
+  const cb = useRef({});
+  cb.current = { onSelectDriver, onSelectJob };
+
+  const sel = state.drivers.find((d) => d.id === selectedDriverId);
+  const routeStops = sel ? sel.route.map((id) => findStop(state, id)).filter((x) => x.stop).map((x) => ({ ...x.stop, jobRef: x.job.ref })) : [];
+  const unassigned = state.jobs.filter((j) => j.status === 'unassigned');
+
+  useEffect(() => {
+    const map = L.map(elRef.current).setView([38.872, -77.09], 13);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '&copy; OpenStreetMap contributors', maxZoom: 19 }).addTo(map);
+    L.marker([P.depot.lat, P.depot.lng], {
+      icon: L.divIcon({ className: '', iconSize: [26, 26], iconAnchor: [13, 13], html: '<div style="width:26px;height:26px;background:#7c3aed;color:#fff;font:700 12px system-ui;display:flex;align-items:center;justify-content:center;border:2px solid #fff;border-radius:4px">D</div>' }),
+    }).bindPopup('Depot (Shirlington)').addTo(map);
+    lay.current = {
+      drivers: new Map(),
+      overlay: L.layerGroup().addTo(map),
+      trail: L.polyline([], { color: '#64748b', weight: 3, opacity: 0.6 }).addTo(map),
+      planned: L.polyline([], { color: '#2563eb', weight: 4, dashArray: '8 6' }).addTo(map),
+    };
+    mapRef.current = map;
+    setTimeout(() => map.invalidateSize(), 100);
+    return () => { map.remove(); mapRef.current = null; };
+  }, []);
+
+  // Driver pins, trail, and planned route update in place as GPS ticks arrive
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map) return;
+    state.drivers.forEach((d) => {
+      const stale = isStale(d, now);
+      const isSel = d.id === selectedDriverId;
+      const key = `${d.status}|${stale}|${isSel}`;
+      let m = lay.current.drivers.get(d.id);
+      if (!m) {
+        m = L.marker(d.pos, { icon: driverIcon(d, isSel, stale) }).addTo(map);
+        m.on('click', () => cb.current.onSelectDriver(d.id));
+        m.bindPopup('');
+        m._k = key;
+        lay.current.drivers.set(d.id, m);
+      } else {
+        m.setLatLng(d.pos);
+        if (m._k !== key) { m.setIcon(driverIcon(d, isSel, stale)); m._k = key; }
+      }
+      m.setZIndexOffset(isSel ? 1000 : 500);
+      const active = state.jobs.filter((j) => j.driverId === d.id && ['assigned', 'in_progress'].includes(j.status)).length;
+      m.setPopupContent(`<b>${esc(d.name)}</b> · ${d.status}<br>${active} active jobs<br>GPS ${fmtAge(now - d.lastPing)} ago`);
+    });
+    lay.current.trail.setLatLngs(sel ? sel.trail : []);
+    const pending = routeStops.filter((s) => ['pending', 'arrived'].includes(s.status));
+    lay.current.planned.setLatLngs(sel && pending.length ? [sel.pos, ...pending.map((s) => [s.lat, s.lng])] : []);
+  });
+
+  // Stops and unassigned jobs are redrawn only when they actually change
+  const overlayKey = JSON.stringify([selectedDriverId, selectedJobId, routeStops.map((s) => s.id + s.status), unassigned.map((j) => j.id + jobColor(j, now))]);
+  useEffect(() => {
+    const g = lay.current?.overlay;
+    if (!g) return;
+    g.clearLayers();
+    routeStops.forEach((s, i) => {
+      L.marker([s.lat, s.lng], { icon: stopIcon(s.status === 'completed' ? '✓' : s.status === 'failed' ? '✕' : i + 1, s.status) })
+        .bindPopup(`<b>Stop ${i + 1}: ${s.kind === 'pickup' ? 'Pickup' : 'Dropoff'}</b><br>${esc(s.jobRef)}<br>${esc(s.address)}<br>Status: ${s.status}`)
+        .addTo(g);
+    });
+    unassigned.forEach((j) => {
+      const d = j.stops[1];
+      const m = L.marker([d.lat, d.lng], { icon: jobIcon(jobColor(j, now), j.id === selectedJobId) })
+        .bindPopup(`<b>${esc(j.ref)}</b> · ${esc(j.clientName ?? j.recipient)}<br>${esc(j.stops[0].address)} → ${esc(d.address)}<br>${j.type === 'on_demand' ? `On-demand · waiting ${fmtAge(now - j.createdAt)}` : `Scheduled · ${windowText(j)}`}`)
+        .addTo(g);
+      m.on('click', () => cb.current.onSelectJob(j.id));
+    });
+  }, [overlayKey]);
+
+  useEffect(() => {
+    const map = mapRef.current;
+    if (map && sel && !map.getBounds().pad(-0.1).contains(sel.pos)) map.panTo(sel.pos);
+  }, [selectedDriverId]);
+
+  const alerts = [
+    ...state.jobs.filter((j) => j.status === 'failed' && !j.reviewed).map((j) => ({
+      key: `f-${j.id}`, level: 'red', text: `${j.ref} failed: ${j.stops.find((s) => s.status === 'failed')?.failureReason}`,
+      pos: [j.stops[1].lat, j.stops[1].lng], go: () => j.driverId && onSelectDriver(j.driverId),
+    })),
+    ...state.jobs.filter((j) => j.status === 'unassigned' && j.type === 'on_demand' && now - j.createdAt > 30 * MIN).map((j) => ({
+      key: `w-${j.id}`, level: 'red', text: `${j.ref} unassigned for ${fmtAge(now - j.createdAt)}`,
+      pos: [j.stops[1].lat, j.stops[1].lng], go: () => onSelectJob(j.id),
+    })),
+    ...state.jobs.filter((j) => ['unassigned', 'assigned', 'in_progress'].includes(j.status) && j.windowEnd && j.windowEnd < now).map((j) => ({
+      key: `l-${j.id}`, level: 'red', text: `${j.ref} past window (ended ${fmtTime(j.windowEnd)})`,
+      pos: [j.stops[1].lat, j.stops[1].lng], go: () => (j.driverId ? onSelectDriver(j.driverId) : onSelectJob(j.id)),
+    })),
+    ...state.drivers.filter((d) => isStale(d, now)).map((d) => ({
+      key: `g-${d.id}`, level: 'amber', text: `${d.name}: no GPS for ${fmtAge(now - d.lastPing)}`,
+      pos: d.pos, go: () => onSelectDriver(d.id),
+    })),
+  ];
+
+  return (
+    <div className="h-full flex flex-col text-sm">
+      <div className="flex flex-wrap items-center gap-4 bg-slate-900 text-white px-4 py-2">
+        <span className="font-semibold">Live Map · Arlington, VA</span>
+        <span className="text-slate-300">{state.drivers.filter((d) => d.status !== 'offline').length} drivers on · {unassigned.length} unassigned</span>
+        {sel && (
+          <span className="bg-blue-600 rounded px-2 py-0.5">
+            {sel.name} · {routeStops.filter((s) => ['pending', 'arrived'].includes(s.status)).length} stops left
+            <button onClick={() => onSelectDriver(null)} className="ml-2 opacity-75 hover:opacity-100">✕</button>
+          </span>
+        )}
+        <div className="ml-auto flex flex-wrap gap-3 text-xs">
+          <span><span className="inline-block w-3 h-3 rounded-full bg-green-600 mr-1" />Available</span>
+          <span><span className="inline-block w-3 h-3 rounded-full bg-blue-600 mr-1" />Busy</span>
+          <span><span className="inline-block w-3 h-3 rounded-full bg-slate-400 mr-1" />Offline</span>
+          <span><span className="inline-block w-3 h-3 rotate-45 bg-orange-600 mr-1" />Unassigned</span>
+          <span><span className="inline-block w-4 border-t-2 border-slate-400 mr-1 align-middle" />Trail</span>
+          <span><span className="inline-block w-4 border-t-2 border-dashed border-blue-500 mr-1 align-middle" />Planned</span>
+        </div>
+      </div>
+      <div ref={elRef} className="flex-1 min-h-0" />
+      <div className="bg-white border-t px-4 py-2">
+        <div className="font-semibold mb-1">Exceptions ({alerts.length})</div>
+        <div className="flex gap-2 overflow-x-auto min-h-[2.5rem]">
+          {alerts.length === 0 && <span className="text-slate-400 py-2">All clear</span>}
+          {alerts.map((a) => (
+            <button
+              key={a.key}
+              onClick={() => { a.go(); mapRef.current?.flyTo(a.pos, 15, { duration: 0.8 }); }}
+              className={`shrink-0 rounded px-3 py-2 text-left border-l-4 ${a.level === 'red' ? 'border-red-600 bg-red-50' : 'border-amber-500 bg-amber-50'}`}
+            >
+              {a.text}
+            </button>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ================= Driver app (phone) ================= */
+function DriverApp({ state, api, now, driverId, setDriverId }) {
+  return (
+    <div className="flex flex-col items-center gap-3">
+      <label className="text-sm text-slate-600">
+        Viewing phone of
+        <select value={driverId} onChange={(e) => setDriverId(e.target.value)} className="border rounded px-2 py-1 ml-2 bg-white">
+          {state.drivers.map((d) => <option key={d.id} value={d.id}>{d.name}</option>)}
+        </select>
+      </label>
+      <Phone key={driverId} state={state} api={api} now={now} driverId={driverId} />
+    </div>
+  );
+}
+
+function Phone({ state, api, now, driverId }) {
+  const driver = state.drivers.find((d) => d.id === driverId);
+  const [screen, setScreen] = useState('route');
+  const [stopId, setStopId] = useState(null);
+  const [banner, setBanner] = useState(null);
+  const countRef = useRef(null);
+  const stops = driver.route.map((id) => findStop(state, id)).filter((x) => x.stop).map((x) => ({ ...x.stop, job: x.job }));
+
+  // The real app vibrates; the demo shows a banner
+  useEffect(() => {
+    if (countRef.current !== null && stops.length > countRef.current) {
+      setBanner('📳 New stop added by dispatch');
+      const t = setTimeout(() => setBanner(null), 3000);
+      countRef.current = stops.length;
+      return () => clearTimeout(t);
+    }
+    countRef.current = stops.length;
+  }, [stops.length]);
+
+  const props = { driver, stops, api, stopId };
+  return (
+    <div className="w-[360px] h-[740px] bg-slate-900 rounded-[2.75rem] p-3 shadow-2xl shrink-0">
+      <div className="w-full h-full bg-slate-100 rounded-[2.1rem] overflow-hidden flex flex-col relative text-sm">
+        <div className="bg-slate-900 text-white text-xs flex justify-between px-6 pt-2 pb-1">
+          <span>{new Date(now).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}</span>
+          <span>📶 🔋</span>
+        </div>
+        {banner && <div className="absolute top-9 left-3 right-3 z-30 bg-blue-600 text-white rounded-lg px-3 py-2 shadow-lg">{banner}</div>}
+        {screen === 'route' && <RouteScreen {...props} onOpen={(id) => { setStopId(id); setScreen('stop'); }} />}
+        {screen === 'stop' && <StopScreen {...props} onBack={() => setScreen('route')} onDeliver={() => setScreen('proof')} />}
+        {screen === 'proof' && <ProofScreen {...props} onBack={() => setScreen('stop')} onDone={() => setScreen('route')} />}
+      </div>
+    </div>
+  );
+}
+
+function PhoneHeader({ title, onBack }) {
+  return (
+    <div className="bg-slate-900 text-white px-4 py-3 flex items-center gap-3">
+      {onBack && <button onClick={onBack} className="text-blue-300">‹ Back</button>}
+      <span className="font-semibold">{title}</span>
+    </div>
+  );
+}
+
+function RouteScreen({ driver, stops, api, onOpen }) {
+  const onShift = driver.status !== 'offline';
+  const remaining = stops.filter((s) => ['pending', 'arrived'].includes(s.status));
+  const nextId = remaining[0]?.id;
+  const clockOut = () => {
+    if (remaining.length && !window.confirm(`You still have ${remaining.length} stops. Clock out anyway?`)) return;
+    api.clockOut(driver.id);
+  };
+
+  return (
+    <>
+      <PhoneHeader title="My Route" />
+      <div className="bg-white px-4 py-3 flex justify-between items-center border-b">
+        <div>
+          <div className="font-bold text-slate-900 text-base">{driver.name}</div>
+          <div className={`text-xs font-medium ${onShift ? 'text-green-600' : 'text-slate-500'}`}>
+            {onShift ? `● On shift · ${remaining.length} stops left` : '○ Off shift'}
+          </div>
+        </div>
+        <button onClick={() => (onShift ? clockOut() : api.clockIn(driver.id))} className={`${onShift ? 'bg-red-600' : 'bg-green-600'} text-white font-bold rounded-lg px-4 py-2`}>
+          {onShift ? 'Clock out' : 'Clock in'}
+        </button>
+      </div>
+      <div className="flex-1 overflow-auto p-3 space-y-2">
+        {!onShift ? (
+          <p className="text-center text-slate-500 mt-10 px-6">Clock in to start your shift and see your stops.</p>
+        ) : stops.length === 0 ? (
+          <p className="text-center text-slate-500 mt-10 px-6">No stops yet. New jobs will appear here.</p>
+        ) : (
+          stops.map((s, i) => {
+            const done = ['completed', 'failed'].includes(s.status);
+            const isNext = s.id === nextId;
+            return (
+              <button key={s.id} onClick={() => onOpen(s.id)} className={`w-full text-left flex gap-3 bg-white rounded-xl p-3 ${isNext ? 'border-2 border-blue-600' : 'border border-slate-200'} ${done ? 'opacity-50' : ''}`}>
+                <span className="w-8 h-8 rounded-full text-white font-bold flex items-center justify-center shrink-0" style={{ background: STOP_COLORS[s.status] }}>
+                  {s.status === 'completed' ? '✓' : s.status === 'failed' ? '✕' : i + 1}
+                </span>
+                <span className="flex-1">
+                  <span className="block text-[11px] font-bold text-slate-500 tracking-wide">{s.kind === 'pickup' ? 'PICKUP' : 'DROPOFF'}{isNext ? '  ·  NEXT' : ''}</span>
+                  <span className="block font-semibold text-slate-900">{s.address}</span>
+                  <span className="block text-xs text-slate-500 mt-0.5">{s.job.clientName ?? s.job.recipient} · {windowText(s.job)} · {s.job.ref}</span>
+                </span>
+              </button>
+            );
+          })
+        )}
+      </div>
+    </>
+  );
+}
+
+function StopScreen({ driver, stops, stopId, api, onBack, onDeliver }) {
+  const [showReasons, setShowReasons] = useState(false);
+  const stop = stops.find((s) => s.id === stopId);
+  if (!stop) return (<><PhoneHeader title="Stop" onBack={onBack} /><p className="p-6 text-slate-500">This stop is no longer on your route.</p></>);
+
+  const job = stop.job;
+  const pickupDone = stop.kind === 'pickup' || job.stops[0].status === 'completed';
+  const open = ['pending', 'arrived'].includes(stop.status);
+  const act = (status, reason) => {
+    api.setStopStatus(stop.id, status, reason ?? null, null, driver.name);
+    if (status !== 'arrived') onBack();
+  };
+  const big = 'w-full rounded-xl py-4 font-bold text-base';
+
+  return (
+    <>
+      <PhoneHeader title="Stop" onBack={onBack} />
+      <div className="flex-1 overflow-auto p-4 space-y-3">
+        <div className="bg-white rounded-xl p-4 border space-y-1">
+          <div className="text-xs font-bold text-slate-500 tracking-wide">{stop.kind === 'pickup' ? 'PICKUP' : 'DROPOFF'} · {job.ref}</div>
+          <div className="text-lg font-bold text-slate-900">{stop.address}</div>
+          {job.clientName && <div className="text-slate-600">{job.clientName}</div>}
+          {job.recipient && <div className="text-slate-600">Recipient: {job.recipient}</div>}
+          <div className="text-slate-600">When: {windowText(job)}</div>
+          <div className="font-semibold" style={{ color: STOP_COLORS[stop.status] }}>Status: {stop.status}</div>
+        </div>
+        {job.notes && (
+          <div className="bg-yellow-50 border border-yellow-300 rounded-xl p-3">
+            <div className="font-bold text-yellow-800">Notes from dispatch</div>
+            <div className="text-yellow-900">{job.notes}</div>
+          </div>
+        )}
+        <div className="flex gap-2">
+          <button onClick={() => window.open(`https://www.google.com/maps/dir/?api=1&destination=${stop.lat},${stop.lng}`, '_blank')} className="flex-1 bg-white border rounded-xl py-3 font-semibold">🧭 Navigate</button>
+          {job.phone && <button onClick={() => alert(`The real app would call ${job.phone}`)} className="flex-1 bg-white border rounded-xl py-3 font-semibold">📞 Call</button>}
+        </div>
+
+        {open && (
+          <>
+            {stop.status === 'pending' && <button onClick={() => act('arrived')} className={`${big} bg-blue-600 text-white`}>I've arrived</button>}
+            {stop.kind === 'pickup' ? (
+              <button onClick={() => act('completed')} className={`${big} bg-green-600 text-white`}>Picked up</button>
+            ) : (
+              <>
+                <button disabled={!pickupDone} onClick={onDeliver} className={`${big} bg-green-600 text-white disabled:opacity-40`}>Deliver</button>
+                {!pickupDone && <p className="text-center text-slate-500 text-xs">Complete the pickup for this job first.</p>}
+              </>
+            )}
+            <button onClick={() => setShowReasons((v) => !v)} className={`${big} border-2 border-red-600 text-red-600`}>Can't complete</button>
+            {showReasons && FAIL_REASONS.map((r) => (
+              <button key={r} onClick={() => window.confirm(`Mark as failed: "${r}"?`) && act('failed', r)} className="w-full text-left bg-white border border-red-200 rounded-lg p-3">{r}</button>
+            ))}
+          </>
+        )}
+      </div>
+    </>
+  );
+}
+
+function ProofScreen({ driver, stops, stopId, api, onBack, onDone }) {
+  const [photo, setPhoto] = useState(null);
+  const [sig, setSig] = useState(null);
+  const [showSign, setShowSign] = useState(false);
+  const [name, setName] = useState('');
+  const [saving, setSaving] = useState(false);
+  const stop = stops.find((s) => s.id === stopId);
+  if (!stop) return (<><PhoneHeader title="Proof of Delivery" onBack={onBack} /><p className="p-6 text-slate-500">This stop is no longer on your route.</p></>);
+
+  const complete = () => {
+    if (!photo) return alert('Take a photo of the delivered item.');
+    setSaving(true);
+    setTimeout(() => {
+      api.setStopStatus(stop.id, 'completed', null, { photo, signature: sig, name: name.trim(), at: Date.now() }, driver.name);
+      onDone();
+    }, 600);
+  };
+
+  return (
+    <>
+      <PhoneHeader title="Proof of Delivery" onBack={onBack} />
+      <div className="flex-1 overflow-auto p-4 space-y-4">
+        <div className="font-bold text-slate-900">{stop.address}</div>
+        <div className="space-y-2">
+          <div className="font-semibold text-slate-600">Photo (required)</div>
+          {photo ? (
+            <button onClick={() => setPhoto(makePhoto(stop.address))} className="w-full">
+              <img src={photo} className="w-full rounded-xl" />
+              <span className="block text-blue-600 mt-1">Tap to retake</span>
+            </button>
+          ) : (
+            <button onClick={() => setPhoto(makePhoto(stop.address))} className="w-full rounded-xl py-4 font-bold bg-blue-600 text-white">📷 Take photo</button>
+          )}
+        </div>
+        <div className="space-y-2">
+          <div className="font-semibold text-slate-600">Signature (optional)</div>
+          {sig ? (
+            <button onClick={() => setShowSign(true)} className="w-full">
+              <img src={sig} className="w-full h-24 object-contain bg-white rounded-xl border" />
+              <span className="block text-blue-600 mt-1">Tap to sign again</span>
+            </button>
+          ) : (
+            <button onClick={() => setShowSign(true)} className="w-full rounded-xl py-4 font-semibold bg-white border">✍️ Get signature</button>
+          )}
+        </div>
+        <div className="space-y-2">
+          <div className="font-semibold text-slate-600">Received by (optional)</div>
+          <input value={name} onChange={(e) => setName(e.target.value)} placeholder="Name" className="w-full bg-white border rounded-lg p-3" />
+        </div>
+        <button onClick={complete} disabled={saving} className={`w-full rounded-xl py-4 font-bold text-white bg-green-600 ${!photo || saving ? 'opacity-50' : ''}`}>
+          {saving ? 'Uploading…' : 'Complete delivery'}
+        </button>
+      </div>
+      {showSign && <SignaturePad onCancel={() => setShowSign(false)} onSave={(data) => { setSig(data); setShowSign(false); }} />}
+    </>
+  );
+}
+
+function SignaturePad({ onSave, onCancel }) {
+  const ref = useRef(null);
+  const drawing = useRef(false);
+  const empty = useRef(true);
+
+  useEffect(() => {
+    const g = ref.current.getContext('2d');
+    g.fillStyle = '#fff';
+    g.fillRect(0, 0, ref.current.width, ref.current.height);
+    g.lineWidth = 4;
+    g.lineCap = 'round';
+    g.lineJoin = 'round';
+    g.strokeStyle = '#0f172a';
+  }, []);
+
+  const pt = (e) => {
+    const r = ref.current.getBoundingClientRect();
+    return [(e.clientX - r.left) * (ref.current.width / r.width), (e.clientY - r.top) * (ref.current.height / r.height)];
+  };
+  const down = (e) => {
+    drawing.current = true;
+    empty.current = false;
+    const g = ref.current.getContext('2d');
+    const [x, y] = pt(e);
+    g.beginPath();
+    g.moveTo(x, y);
+    ref.current.setPointerCapture(e.pointerId);
+  };
+  const move = (e) => {
+    if (!drawing.current) return;
+    const g = ref.current.getContext('2d');
+    const [x, y] = pt(e);
+    g.lineTo(x, y);
+    g.stroke();
+  };
+  const up = () => { drawing.current = false; };
+  const clear = () => {
+    const g = ref.current.getContext('2d');
+    g.fillStyle = '#fff';
+    g.fillRect(0, 0, ref.current.width, ref.current.height);
+    empty.current = true;
+  };
+
+  return (
+    <div className="absolute inset-0 bg-white z-20 flex flex-col p-4 gap-3">
+      <div className="font-bold text-center text-base pt-6">Recipient signature</div>
+      <canvas ref={ref} width={600} height={300} className="w-full border-2 border-slate-300 rounded-xl touch-none" style={{ aspectRatio: '2 / 1' }}
+        onPointerDown={down} onPointerMove={move} onPointerUp={up} onPointerLeave={up} />
+      <div className="text-xs text-slate-500 text-center">Sign with your mouse or finger</div>
+      <div className="flex gap-2">
+        <button onClick={clear} className="flex-1 border rounded-lg py-3">Clear</button>
+        <button onClick={() => (empty.current ? alert('Please sign first') : onSave(ref.current.toDataURL('image/png')))} className="flex-1 bg-blue-600 text-white rounded-lg py-3 font-semibold">Save</button>
+      </div>
+      <button onClick={onCancel} className="text-blue-600 py-2">Cancel</button>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+</body>
+</html>
