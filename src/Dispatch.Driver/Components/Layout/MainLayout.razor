@@ -1,0 +1,56 @@
+@inherits LayoutComponentBase
+@using Dispatch.Driver.Services
+@using Dispatch.Driver.Components.Shared
+@inject AuthService Auth
+@inject DriverState State
+@implements IDisposable
+
+@if (signedIn is null)
+{
+    <div class="center dim">Loading…</div>
+}
+else if (signedIn == false)
+{
+    <Login OnSignedIn="OnSignedInAsync" />
+}
+else
+{
+    <div class="app">@Body</div>
+}
+
+@if (State.Banner is { } banner)
+{
+    <div class="banner">@banner</div>
+}
+
+@code {
+    private bool? signedIn;
+
+    protected override async Task OnInitializedAsync()
+    {
+        Auth.SignedOut += OnSignedOut;
+        State.Changed += OnStateChanged;
+        signedIn = await Auth.IsSignedInAsync();
+        if (signedIn == true) await State.StartAsync();
+    }
+
+    private async Task OnSignedInAsync()
+    {
+        signedIn = true;
+        await State.StartAsync();
+    }
+
+    private void OnSignedOut() => InvokeAsync(() =>
+    {
+        signedIn = false;
+        StateHasChanged();
+    });
+
+    private void OnStateChanged() => InvokeAsync(StateHasChanged);
+
+    public void Dispose()
+    {
+        Auth.SignedOut -= OnSignedOut;
+        State.Changed -= OnStateChanged;
+    }
+}

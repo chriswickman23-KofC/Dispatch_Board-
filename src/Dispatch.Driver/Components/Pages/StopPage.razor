@@ -1,0 +1,130 @@
+@page "/stop/{Id:int}"
+@using Dispatch.Shared
+@using Dispatch.Driver.Services
+@using Dispatch.Driver.Components.Shared
+@inherits StateAwareComponent
+@inject DriverApiClient Api
+@inject NavigationManager Nav
+
+<PhoneHeader Title="Stop" BackTo="/" />
+
+@if (Stop is not { } s)
+{
+    <p class="center dim">This stop is no longer on your route.</p>
+}
+else
+{
+    var open = s.Status is StopStatus.Pending or StopStatus.Arrived;
+
+    <div class="page">
+        <div class="card">
+            <div class="kind">@(s.Kind == StopKind.Pickup ? "PICKUP" : "DROPOFF") · @s.JobRef</div>
+            <div class="address big">@s.Address</div>
+            <div class="meta">@s.DisplayName</div>
+            @if (s.RecipientName is not null) { <div class="meta">Recipient: @s.RecipientName</div> }
+            <div class="meta">When: @Ui.WindowText(s)</div>
+            <div class="status-text @Ui.StatusClass(s.Status)">Status: @s.Status</div>
+        </div>
+
+        @if (s.Notes is not null)
+        {
+            <div class="card notes">
+                <div class="notes-title">Notes from dispatch</div>
+                <div>@s.Notes</div>
+            </div>
+        }
+
+        <div class="row">
+            <button class="btn white" @onclick="NavigateAsync">🧭 Navigate</button>
+            @if (s.RecipientPhone is not null)
+            {
+                <button class="btn white" @onclick="Call">📞 Call</button>
+            }
+        </div>
+
+        @if (message is not null)
+        {
+            <div class="notice error">@message</div>
+        }
+
+        @if (open && !busy)
+        {
+            @if (s.Status == StopStatus.Pending)
+            {
+                <button class="btn blue" @onclick="() => SetStatusAsync(StopStatus.Arrived)">I've arrived</button>
+            }
+
+            @if (s.Kind == StopKind.Pickup)
+            {
+                <button class="btn green" @onclick="() => SetStatusAsync(StopStatus.Completed)">Picked up</button>
+            }
+            else
+            {
+                <button class="btn green" disabled="@(!s.PickupDone)" @onclick="() => Nav.NavigateTo($"/proof/{s.Id}")">Deliver</button>
+                @if (!s.PickupDone)
+                {
+                    <p class="hint">Complete the pickup for this job first.</p>
+                }
+            }
+
+            <button class="btn outline-red" @onclick="() => showReasons = !showReasons">Can't complete</button>
+            @if (showReasons)
+            {
+                @foreach (var reason in FailureReasons.All)
+                {
+                    <button class="reason" @onclick="() => FailAsync(reason)">@reason</button>
+                }
+            }
+        }
+        @if (busy)
+        {
+            <p class="center dim">Saving…</p>
+        }
+    </div>
+}
+
+@code {
+    [Parameter] public int Id { get; set; }
+
+    private bool busy;
+    private bool showReasons;
+    private string? message;
+
+    private RouteStopDto? Stop => State.Stops.FirstOrDefault(s => s.Id == Id);
+
+    private async Task SetStatusAsync(StopStatus status, string? reason = null)
+    {
+        busy = true;
+        message = null;
+        try
+        {
+            await Api.SetStopStatusAsync(Id, status, reason);
+            await State.RefreshAsync();
+            if (status != StopStatus.Arrived) Nav.NavigateTo("/");
+        }
+        catch (Exception ex) when (ex is ApiException or HttpRequestException)
+        {
+            message = ex is HttpRequestException ? "No connection. Move to better signal and try again." : ex.Message;
+        }
+        busy = false;
+    }
+
+    private async Task FailAsync(string reason)
+    {
+        if (await Ui.ConfirmAsync("Can't complete stop", $"Mark as failed: \"{reason}\"?", "Mark failed"))
+            await SetStatusAsync(StopStatus.Failed, reason);
+    }
+
+    private async Task NavigateAsync()
+    {
+        if (Stop is not { } s) return;
+        await Map.Default.OpenAsync(new Location(s.Lat, s.Lng),
+            new MapLaunchOptions { Name = s.Address, NavigationMode = NavigationMode.Driving });
+    }
+
+    private void Call()
+    {
+        if (Stop?.RecipientPhone is { } phone && PhoneDialer.Default.IsSupported)
+            PhoneDialer.Default.Open(phone);
+    }
+}

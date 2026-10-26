@@ -1,0 +1,19 @@
+@inject NavigationManager Nav
+
+<header class="phone-header">
+    @if (BackTo is not null)
+    {
+        <button class="back" @onclick="() => Nav.NavigateTo(BackTo)">‹ Back</button>
+    }
+    <span class="title">@Title</span>
+    @if (OnRefresh.HasDelegate)
+    {
+        <button class="refresh" @onclick="OnRefresh">↻</button>
+    }
+</header>
+
+@code {
+    [Parameter] public string Title { get; set; } = "";
+    [Parameter] public string? BackTo { get; set; }
+    [Parameter] public EventCallback OnRefresh { get; set; }
+}

@@ -1,0 +1,112 @@
+@page "/"
+@using Dispatch.Shared
+@using Dispatch.Driver.Services
+@using Dispatch.Driver.Components.Shared
+@inherits StateAwareComponent
+@inject ShiftService Shift
+@inject AuthService Auth
+@inject NavigationManager Nav
+
+<PhoneHeader Title="My Route" OnRefresh="State.RefreshAsync" />
+
+@if (State.Profile is not { } me)
+{
+    <p class="center dim">@(State.Error ?? "Loading…")</p>
+}
+else
+{
+    var onShift = me.Status != DriverStatus.Offline;
+    var remaining = State.Stops.Where(s => s.Status is StopStatus.Pending or StopStatus.Arrived).ToList();
+    var nextId = remaining.FirstOrDefault()?.Id;
+
+    <div class="shift-bar">
+        <div>
+            <div class="name">@me.Name</div>
+            <div class="shift @(onShift ? "on" : "")">@(onShift ? $"● On shift · {remaining.Count} stops left" : "○ Off shift")</div>
+        </div>
+        <button class="btn @(onShift ? "red" : "green") small" disabled="@busy"
+                @onclick="() => onShift ? ClockOutAsync(remaining.Count) : ClockInAsync()">
+            @(busy ? "…" : onShift ? "Clock out" : "Clock in")
+        </button>
+    </div>
+
+    @if (message is not null)
+    {
+        <div class="notice error">@message</div>
+    }
+    @if (State.Error is { } err)
+    {
+        <div class="notice">@err</div>
+    }
+
+    @if (!onShift)
+    {
+        <p class="center dim">Clock in to start your shift and see your stops.</p>
+        <button class="link center-block" @onclick="Auth.SignOut">Sign out</button>
+    }
+    else if (State.Stops.Count == 0)
+    {
+        <p class="center dim">No stops yet. New jobs will appear here.</p>
+    }
+    else
+    {
+        <div class="stops">
+            @for (var i = 0; i < State.Stops.Count; i++)
+            {
+                var s = State.Stops[i];
+                var index = i;
+                var done = s.Status is StopStatus.Completed or StopStatus.Failed;
+                var isNext = s.Id == nextId;
+                <button class="stop-card @(isNext ? "next" : "") @(done ? "done" : "")" @onclick="() => Nav.NavigateTo($"/stop/{s.Id}")">
+                    <span class="seq @Ui.StatusClass(s.Status)">
+                        @(s.Status switch { StopStatus.Completed => "✓", StopStatus.Failed => "✕", _ => (index + 1).ToString() })
+                    </span>
+                    <span class="stop-text">
+                        <span class="kind">@(s.Kind == StopKind.Pickup ? "PICKUP" : "DROPOFF")@(isNext ? "  ·  NEXT" : "")</span>
+                        <span class="address">@s.Address</span>
+                        <span class="meta">@s.DisplayName · @Ui.WindowText(s) · @s.JobRef</span>
+                    </span>
+                </button>
+            }
+        </div>
+    }
+}
+
+@code {
+    private bool busy;
+    private string? message;
+
+    private async Task ClockInAsync()
+    {
+        busy = true;
+        message = null;
+        try
+        {
+            State.SetProfile(await Shift.ClockInAsync());
+            await State.RefreshAsync();
+        }
+        catch (Exception ex) when (ex is ApiException or HttpRequestException)
+        {
+            message = ex.Message;
+        }
+        busy = false;
+    }
+
+    private async Task ClockOutAsync(int remaining)
+    {
+        if (remaining > 0 && !await Ui.ConfirmAsync("Stops remaining", $"You still have {remaining} stops. Clock out anyway?", "Clock out"))
+            return;
+
+        busy = true;
+        message = null;
+        try
+        {
+            State.SetProfile(await Shift.ClockOutAsync());
+        }
+        catch (Exception ex) when (ex is ApiException or HttpRequestException)
+        {
+            message = ex.Message;
+        }
+        busy = false;
+    }
+}

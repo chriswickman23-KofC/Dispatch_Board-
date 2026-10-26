@@ -1,0 +1,36 @@
+@using Dispatch.Driver.Services
+@inject AuthService Auth
+
+<div class="login">
+    <div class="login-card">
+        <h1>Driver Sign In</h1>
+        <input type="email" placeholder="Email" autocapitalize="none" autocomplete="username" @bind="email" />
+        <input type="password" placeholder="Password" autocomplete="current-password" @bind="password" />
+        @if (error is not null)
+        {
+            <p class="error">@error</p>
+        }
+        <button class="btn blue" disabled="@busy" @onclick="SignInAsync">@(busy ? "Signing in…" : "Sign in")</button>
+    </div>
+</div>
+
+@code {
+    [Parameter] public EventCallback OnSignedIn { get; set; }
+
+    private string email = "";
+    private string password = "";
+    private string? error;
+    private bool busy;
+
+    private async Task SignInAsync()
+    {
+        busy = true;
+        error = await Auth.LoginAsync(email.Trim(), password);
+        busy = false;
+        if (error is null)
+        {
+            password = "";
+            await OnSignedIn.InvokeAsync();
+        }
+    }
+}

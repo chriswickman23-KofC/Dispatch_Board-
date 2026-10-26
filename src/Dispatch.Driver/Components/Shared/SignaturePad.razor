@@ -1,0 +1,55 @@
+@inject IJSRuntime JS
+@implements IAsyncDisposable
+
+<div class="sig-overlay">
+    <div class="sig-title">Recipient signature</div>
+    <canvas @ref="canvas" width="600" height="300" class="sig-canvas"></canvas>
+    <div class="hint">Sign with your finger</div>
+    @if (error is not null)
+    {
+        <div class="notice error">@error</div>
+    }
+    <div class="row">
+        <button class="btn white" @onclick="ClearAsync">Clear</button>
+        <button class="btn blue" @onclick="SaveAsync">Save</button>
+    </div>
+    <button class="link center-block" @onclick="OnCancel">Cancel</button>
+</div>
+
+@code {
+    [Parameter] public EventCallback<byte[]> OnSave { get; set; }
+    [Parameter] public EventCallback OnCancel { get; set; }
+
+    private ElementReference canvas;
+    private IJSObjectReference? module;
+    private string? error;
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (!firstRender) return;
+        module = await JS.InvokeAsync<IJSObjectReference>("import", "./js/signature.js");
+        await module.InvokeVoidAsync("init", canvas);
+    }
+
+    private async Task ClearAsync()
+    {
+        if (module is not null) await module.InvokeVoidAsync("clear", canvas);
+    }
+
+    private async Task SaveAsync()
+    {
+        if (module is null) return;
+        if (await module.InvokeAsync<bool>("isEmpty", canvas))
+        {
+            error = "Please sign first.";
+            return;
+        }
+        var dataUrl = await module.InvokeAsync<string>("toPng", canvas);
+        await OnSave.InvokeAsync(Convert.FromBase64String(dataUrl[(dataUrl.IndexOf(',') + 1)..]));
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        if (module is not null) await module.DisposeAsync();
+    }
+}

@@ -1,0 +1,137 @@
+@page "/proof/{Id:int}"
+@using Dispatch.Shared
+@using Dispatch.Driver.Services
+@using Dispatch.Driver.Components.Shared
+@using Microsoft.Maui.Graphics
+@using Microsoft.Maui.Graphics.Platform
+@inherits StateAwareComponent
+@inject DriverApiClient Api
+@inject NavigationManager Nav
+
+<PhoneHeader Title="Proof of Delivery" BackTo="@($"/stop/{Id}")" />
+
+@if (State.Stops.FirstOrDefault(s => s.Id == Id) is not { } stop)
+{
+    <p class="center dim">This stop is no longer on your route.</p>
+}
+else
+{
+    <div class="page">
+        <div class="address">@stop.Address</div>
+
+        <div class="section">
+            <div class="label">Photo (required)</div>
+            @if (photoPreview is not null)
+            {
+                <img class="photo" src="@photoPreview" @onclick="TakePhotoAsync" />
+                <p class="hint">Tap the photo to retake</p>
+            }
+            else
+            {
+                <button class="btn blue" @onclick="TakePhotoAsync">📷 Take photo</button>
+            }
+        </div>
+
+        <div class="section">
+            <div class="label">Signature (optional)</div>
+            @if (signaturePreview is not null)
+            {
+                <img class="signature" src="@signaturePreview" @onclick="() => showSignature = true" />
+                <p class="hint">Tap to sign again</p>
+            }
+            else
+            {
+                <button class="btn white" @onclick="() => showSignature = true">✍️ Get signature</button>
+            }
+        </div>
+
+        <div class="section">
+            <div class="label">Received by (optional)</div>
+            <input class="input" placeholder="Name" @bind="recipientName" />
+        </div>
+
+        @if (message is not null)
+        {
+            <div class="notice error">@message</div>
+        }
+
+        <button class="btn green" disabled="@(photo is null || saving)" @onclick="CompleteAsync">
+            @(saving ? "Uploading…" : "Complete delivery")
+        </button>
+    </div>
+
+    @if (showSignature)
+    {
+        <SignaturePad OnSave="OnSignatureSaved" OnCancel="() => showSignature = false" />
+    }
+}
+
+@code {
+    [Parameter] public int Id { get; set; }
+
+    private byte[]? photo;
+    private string? photoPreview;
+    private byte[]? signature;
+    private string? signaturePreview;
+    private string? recipientName;
+    private bool showSignature;
+    private bool saving;
+    private string? message;
+
+    private async Task TakePhotoAsync()
+    {
+        message = null;
+        if (!MediaPicker.Default.IsCaptureSupported)
+        {
+            message = "This phone's camera isn't available.";
+            return;
+        }
+
+        var file = await MediaPicker.Default.CapturePhotoAsync();
+        if (file is null) return;
+
+        // Shrink before upload: faster on weak signal, cheaper to store
+        await using var stream = await file.OpenReadAsync();
+        var image = PlatformImage.FromStream(stream);
+        var small = image.Downsize(1280, disposeOriginal: true);
+        using var buffer = new MemoryStream();
+        await small.SaveAsync(buffer, ImageFormat.Jpeg, 0.6f);
+
+        photo = buffer.ToArray();
+        photoPreview = $"data:image/jpeg;base64,{Convert.ToBase64String(photo)}";
+    }
+
+    private void OnSignatureSaved(byte[] png)
+    {
+        signature = png;
+        signaturePreview = $"data:image/png;base64,{Convert.ToBase64String(png)}";
+        showSignature = false;
+    }
+
+    private async Task CompleteAsync()
+    {
+        if (photo is null) return;
+        saving = true;
+        message = null;
+        try
+        {
+            var location = await Geolocation.Default.GetLastKnownLocationAsync();
+            await Api.CompleteDeliveryAsync(Id, photo, signature, recipientName, location);
+            await State.RefreshAsync();
+            Nav.NavigateTo("/");
+        }
+        catch (HttpRequestException)
+        {
+            message = "No connection. Your photo is saved here; move to better signal and tap Complete again.";
+        }
+        catch (TaskCanceledException)
+        {
+            message = "The upload timed out. Your photo is saved here; tap Complete again.";
+        }
+        catch (ApiException ex)
+        {
+            message = ex.Message;
+        }
+        saving = false;
+    }
+}
