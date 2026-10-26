@@ -1,0 +1,146 @@
+@using Dispatch.Web.Services
+@inject MapboxGeocoder Geocoder
+@implements IDisposable
+
+<div class="ac">
+    <label class="ac-label">@Label</label>
+    <input class="ac-input @(Value is not null ? "ok" : "")"
+           value="@text"
+           placeholder="@Placeholder"
+           @oninput="OnInputAsync"
+           @onkeydown="OnKeyDownAsync"
+           @onkeydown:preventDefault="open"
+           @onblur="() => open = false" />
+    <div class="ac-hint">
+        @if (Value is not null) { <span class="good">✓ Located</span> }
+        else if (status == "locating") { <span>Locating…</span> }
+        else if (status == "error") { <span class="bad">Couldn't locate that address</span> }
+        else if (text.Trim().Length >= 3) { <span class="warn">Pick an address from the list</span> }
+    </div>
+
+    @if (open)
+    {
+        <ul class="ac-list">
+            @if (suggestions.Count == 0)
+            {
+                <li class="ac-empty">No matches</li>
+            }
+            @for (var i = 0; i < suggestions.Count; i++)
+            {
+                var s = suggestions[i];
+                var index = i;
+                <li class="@(index == highlight ? "hl" : "")"
+                    @onmousedown="() => PickAsync(s)"
+                    @onmousedown:preventDefault>@s.Address</li>
+            }
+        </ul>
+    }
+</div>
+
+@code {
+    [Parameter] public string Label { get; set; } = "";
+    [Parameter] public string? Placeholder { get; set; }
+    [Parameter] public GeoPoint? Value { get; set; }
+    [Parameter] public EventCallback<GeoPoint?> ValueChanged { get; set; }
+    /// <summary>Starts with text from a file and searches it right away (CSV fixes).</summary>
+    [Parameter] public string? InitialText { get; set; }
+
+    private string text = "";
+    private List<GeoSuggestion> suggestions = [];
+    private bool open;
+    private int highlight;
+    private string status = "idle";
+    private string? shownAddress;
+    private CancellationTokenSource? cts;
+
+    protected override void OnInitialized()
+    {
+        text = Value?.Address ?? InitialText ?? "";
+        shownAddress = Value?.Address;
+        if (Value is null && text.Trim().Length >= 3) _ = SearchAsync(text);
+    }
+
+    protected override void OnParametersSet()
+    {
+        // Parent set a value (e.g. client default pickup): show it without searching
+        if (Value is not null && Value.Address != shownAddress)
+        {
+            shownAddress = Value.Address;
+            text = Value.Address;
+            open = false;
+        }
+    }
+
+    private async Task OnInputAsync(ChangeEventArgs e)
+    {
+        text = e.Value?.ToString() ?? "";
+        if (Value is not null)
+        {
+            shownAddress = null;
+            await ValueChanged.InvokeAsync(null);   // editing invalidates the located address
+        }
+        _ = SearchAsync(text);
+    }
+
+    private async Task SearchAsync(string query)
+    {
+        cts?.Cancel();
+        cts = new CancellationTokenSource();
+        var token = cts.Token;
+
+        try { await Task.Delay(300, token); }
+        catch (TaskCanceledException) { return; }
+
+        if (query.Trim().Length < 3)
+        {
+            suggestions = [];
+            open = false;
+            StateHasChanged();
+            return;
+        }
+
+        try
+        {
+            suggestions = await Geocoder.SuggestAsync(query, token);
+            highlight = 0;
+            open = true;
+            status = "idle";
+        }
+        catch (OperationCanceledException) { return; }
+        catch { status = "error"; }
+        StateHasChanged();
+    }
+
+    private async Task PickAsync(GeoSuggestion s)
+    {
+        cts?.Cancel();
+        open = false;
+        text = s.Address;
+        status = "locating";
+
+        var hit = await Geocoder.LocateAsync(s.Address);
+        if (hit is null)
+        {
+            status = "error";
+            await ValueChanged.InvokeAsync(null);
+            return;
+        }
+        status = "idle";
+        text = shownAddress = hit.Address;
+        await ValueChanged.InvokeAsync(new GeoPoint(hit.Address, hit.Lat, hit.Lng));
+    }
+
+    private async Task OnKeyDownAsync(KeyboardEventArgs e)
+    {
+        if (!open || suggestions.Count == 0) return;
+        switch (e.Key)
+        {
+            case "ArrowDown": highlight = Math.Min(highlight + 1, suggestions.Count - 1); break;
+            case "ArrowUp": highlight = Math.Max(highlight - 1, 0); break;
+            case "Enter": await PickAsync(suggestions[highlight]); break;
+            case "Escape": open = false; break;
+        }
+    }
+
+    public void Dispose() => cts?.Cancel();
+}

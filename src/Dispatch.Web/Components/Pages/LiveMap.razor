@@ -1,0 +1,379 @@
+@page "/dispatch/map"
+@layout Dispatch.Web.Components.Layout.BoardLayout
+@rendermode @(new InteractiveServerRenderMode(prerender: false))
+@attribute [Authorize(Roles = Roles.DispatchStaff)]
+@implements IAsyncDisposable
+
+@using System.Security.Claims
+@using Dispatch.Shared
+@using Dispatch.Web.Services
+@using Microsoft.AspNetCore.Authorization
+
+@inject MapQueries Queries
+@inject BoardQueries Profiles
+@inject DispatchEvents Events
+@inject SelectionSync SelectionSync
+@inject DispatchClock Clock
+@inject IJSRuntime JS
+
+<PageTitle>Live Map · Dispatch</PageTitle>
+
+<div class="live-map">
+    <header class="topbar">
+        <span class="brand">Live Map · Arlington, VA</span>
+        <select @bind="zoneFilter" @bind:after="SyncMapAsync">
+            <option value="0">All zones</option>
+            @foreach (var z in snapshot.Zones)
+            {
+                <option value="@z.Id">@z.Name</option>
+            }
+        </select>
+        <span class="dim">@visibleDrivers.Count(d => d.Status != DriverStatus.Offline) drivers on · @unassigned.Count unassigned</span>
+
+        @if (SelectedDriver is { } sd)
+        {
+            <span class="chip">
+                @sd.Name · @RemainingStops.Count stops left
+                <button @onclick="() => SelectionSync.SetDriver(userId, null)" title="Clear">✕</button>
+            </span>
+        }
+
+        <div class="legend">
+            <span><i class="dot available"></i>Available</span>
+            <span><i class="dot busy"></i>Busy</span>
+            <span><i class="dot offline"></i>Offline</span>
+            <span><i class="diamond"></i>Unassigned</span>
+            <span><i class="dot stale"></i>Stale GPS</span>
+            <span><i class="line"></i>Trail</span>
+            <span><i class="line dashed"></i>Planned</span>
+        </div>
+    </header>
+
+    <div class="map" @ref="mapElement"></div>
+
+    <footer class="exceptions">
+        <strong>Exceptions (@alerts.Count)</strong>
+        <div class="alert-row">
+            @if (alerts.Count == 0)
+            {
+                <span class="dim">All clear</span>
+            }
+            @foreach (var a in alerts)
+            {
+                <button class="alert @(a.Red ? "red" : "amber")" @onclick="() => FocusAlertAsync(a)">@a.Text</button>
+            }
+        </div>
+    </footer>
+</div>
+
+@code {
+    [CascadingParameter] private Task<AuthenticationState> AuthState { get; set; } = default!;
+
+    private sealed record Alert(string Key, string Text, bool Red, double Lat, double Lng, int? DriverId, int? JobId);
+
+    private MapSnapshot snapshot = MapSnapshot.Empty;
+    private string userId = "";
+    private int zoneFilter;
+    private int? selectedDriverId;
+    private int? selectedJobId;
+    private List<double[]> trail = [];
+    private DateTimeOffset nowUtc = DateTimeOffset.UtcNow;
+
+    private ElementReference mapElement;
+    private IJSObjectReference? module;
+    private DotNetObjectReference<LiveMap>? selfRef;
+    private Timer? ticker;
+    private CancellationTokenSource? reloadCts;
+    private string? lastOverlayKey;
+
+    private List<MapDriverVm> visibleDrivers = [];
+    private List<MapJobVm> unassigned = [];
+    private List<(MapStopVm Stop, MapJobVm Job)> routeStops = [];
+    private List<Alert> alerts = [];
+
+    private MapDriverVm? SelectedDriver => snapshot.Drivers.FirstOrDefault(d => d.Id == selectedDriverId);
+    private List<MapStopVm> RemainingStops =>
+        routeStops.Select(r => r.Stop).Where(s => s.Status is StopStatus.Pending or StopStatus.Arrived).ToList();
+
+    // ---------- Lifecycle ----------
+
+    protected override async Task OnInitializedAsync()
+    {
+        userId = (await AuthState).User.FindFirstValue(ClaimTypes.NameIdentifier)!;
+        zoneFilter = (await Profiles.GetProfileAsync(userId)).ZoneId ?? 0;
+
+        var shared = SelectionSync.Get(userId);
+        selectedDriverId = shared.DriverId;
+        selectedJobId = shared.JobId;
+
+        snapshot = await Queries.LoadAsync();
+        if (selectedDriverId is int d) trail = await Queries.GetTrailAsync(d);
+
+        Events.Changed += OnDispatchChanged;
+        SelectionSync.Changed += OnSelectionChanged;
+
+        ticker = new Timer(_ => _ = InvokeAsync(async () =>
+        {
+            nowUtc = DateTimeOffset.UtcNow;
+            await SyncMapAsync();
+            StateHasChanged();
+        }), null, 5000, 5000);
+    }
+
+    protected override bool ShouldRender()
+    {
+        Recompute();
+        return true;
+    }
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (!firstRender) return;
+        module = await JS.InvokeAsync<IJSObjectReference>("import", "./js/dispatchMap.js");
+        selfRef = DotNetObjectReference.Create(this);
+        await module.InvokeVoidAsync("init", mapElement, selfRef, new[] { 38.872, -77.09 });
+        await SyncMapAsync();
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        Events.Changed -= OnDispatchChanged;
+        SelectionSync.Changed -= OnSelectionChanged;
+        reloadCts?.Cancel();
+        if (ticker is not null) await ticker.DisposeAsync();
+        if (module is not null)
+        {
+            try
+            {
+                await module.InvokeVoidAsync("dispose");
+                await module.DisposeAsync();
+            }
+            catch (JSDisconnectedException) { /* browser already closed */ }
+        }
+        selfRef?.Dispose();
+    }
+
+    // ---------- Clicks from the map ----------
+
+    [JSInvokable] public void OnDriverClicked(int driverId) => SelectionSync.SetDriver(userId, driverId);
+    [JSInvokable] public void OnJobClicked(int jobId) => SelectionSync.SetJob(userId, jobId);
+
+    private async Task FocusAlertAsync(Alert a)
+    {
+        if (a.DriverId is int d) SelectionSync.SetDriver(userId, d);
+        else if (a.JobId is int j) SelectionSync.SetJob(userId, j);
+        if (module is not null) await module.InvokeVoidAsync("flyTo", a.Lat, a.Lng);
+    }
+
+    // ---------- Live updates ----------
+
+    private Task OnDispatchChanged(DispatchChange change) => InvokeAsync(async () =>
+    {
+        if (change.Kind is ChangeKind.Locations or ChangeKind.Drivers)
+        {
+            var drivers = await Queries.LoadDriversAsync();
+            snapshot = snapshot with { Drivers = drivers };
+
+            // Extend the selected driver's trail with the new position
+            if (change.DriverId == selectedDriverId &&
+                drivers.FirstOrDefault(d => d.Id == change.DriverId) is { Lat: double lat, Lng: double lng })
+            {
+                var last = trail.LastOrDefault();
+                if (last is null || last[0] != lat || last[1] != lng) trail.Add([lat, lng]);
+            }
+            await SyncMapAsync();
+            StateHasChanged();
+            return;
+        }
+
+        reloadCts?.Cancel();
+        reloadCts = new CancellationTokenSource();
+        _ = DebouncedReloadAsync(reloadCts.Token);
+    });
+
+    private async Task DebouncedReloadAsync(CancellationToken token)
+    {
+        try { await Task.Delay(250, token); }
+        catch (TaskCanceledException) { return; }
+        snapshot = await Queries.LoadAsync();
+        await SyncMapAsync();
+        StateHasChanged();
+    }
+
+    private void OnSelectionChanged(string changedUserId, SelectionState state)
+    {
+        if (changedUserId != userId) return;
+        _ = InvokeAsync(async () =>
+        {
+            var driverChanged = state.DriverId != selectedDriverId;
+            var jobChanged = state.JobId != selectedJobId;
+            selectedDriverId = state.DriverId;
+            selectedJobId = state.JobId;
+
+            if (driverChanged)
+            {
+                trail = selectedDriverId is int d ? await Queries.GetTrailAsync(d) : [];
+                if (module is not null && SelectedDriver is { Lat: double lat, Lng: double lng })
+                    await module.InvokeVoidAsync("panToIfHidden", lat, lng);
+            }
+            if (jobChanged && module is not null &&
+                snapshot.Jobs.FirstOrDefault(j => j.Id == selectedJobId)?.Dropoff is { } drop)
+            {
+                await module.InvokeVoidAsync("panToIfHidden", drop.Lat, drop.Lng);
+            }
+
+            await SyncMapAsync();
+            StateHasChanged();
+        });
+    }
+
+    // ---------- Pushing data to Leaflet ----------
+
+    private async Task SyncMapAsync()
+    {
+        if (module is null) return;
+        Recompute();
+
+        var drivers = visibleDrivers
+            .Where(d => d.Lat is not null && d.Lng is not null)
+            .Select(d => new
+            {
+                id = d.Id,
+                initials = Initials(d.Name),
+                status = d.Status.ToString().ToLowerInvariant(),
+                lat = d.Lat,
+                lng = d.Lng,
+                stale = IsStale(d),
+                selected = d.Id == selectedDriverId,
+                popup = new[]
+                {
+                    $"{d.Name} · {d.Status}",
+                    $"{ActiveJobCount(d.Id)} active jobs",
+                    d.LastPingAt is { } ping ? $"GPS {FormatAge(nowUtc - ping)} ago" : "No GPS yet",
+                },
+            });
+        await module.InvokeVoidAsync("setDrivers", drivers);
+
+        // Stops and unassigned jobs are redrawn only when something about them changes
+        var overlayKey = string.Join("|",
+            selectedDriverId, selectedJobId,
+            string.Join(",", routeStops.Select(r => $"{r.Stop.Id}:{r.Stop.Status}:{r.Stop.Sequence}")),
+            string.Join(",", unassigned.Select(j => $"{j.Id}:{JobColor(j)}")));
+
+        if (overlayKey != lastOverlayKey)
+        {
+            lastOverlayKey = overlayKey;
+
+            var stops = routeStops.Select((r, i) => new
+            {
+                lat = r.Stop.Lat,
+                lng = r.Stop.Lng,
+                status = r.Stop.Status.ToString().ToLowerInvariant(),
+                label = r.Stop.Status switch { StopStatus.Completed => "✓", StopStatus.Failed => "✕", _ => (i + 1).ToString() },
+                popup = new[]
+                {
+                    $"Stop {i + 1}: {(r.Stop.Kind == StopKind.Pickup ? "Pickup" : "Dropoff")}",
+                    $"{r.Job.Ref} · {r.Job.DisplayName}",
+                    r.Stop.Address,
+                    $"Status: {r.Stop.Status}",
+                },
+            });
+
+            var jobs = unassigned
+                .Where(j => j.Dropoff is not null)
+                .Select(j => new
+                {
+                    id = j.Id,
+                    lat = j.Dropoff!.Lat,
+                    lng = j.Dropoff.Lng,
+                    color = JobColor(j),
+                    selected = j.Id == selectedJobId,
+                    popup = new[]
+                    {
+                        $"{j.Ref} · {j.DisplayName}",
+                        $"{j.Pickup?.Address} → {j.Dropoff.Address}",
+                        j.Type == JobType.OnDemand ? $"On-demand · waiting {FormatAge(nowUtc - j.CreatedAt)}" : "Scheduled",
+                    },
+                });
+
+            await module.InvokeVoidAsync("setOverlay", stops, jobs);
+        }
+
+        var plannedLine = SelectedDriver is { Lat: double lat, Lng: double lng } && RemainingStops.Count > 0
+            ? new List<double[]> { new[] { lat, lng } }.Concat(RemainingStops.Select(s => new[] { s.Lat, s.Lng })).ToList()
+            : [];
+        await module.InvokeVoidAsync("setLines", selectedDriverId is null ? [] : trail, plannedLine);
+    }
+
+    // ---------- Derived data ----------
+
+    private void Recompute()
+    {
+        visibleDrivers = snapshot.Drivers.Where(d => InZone(d.ZoneId)).ToList();
+        unassigned = snapshot.Jobs.Where(j => j.Status == JobStatus.Unassigned && InZone(j.ZoneId)).ToList();
+
+        var route = snapshot.Routes.FirstOrDefault(r => r.DriverId == selectedDriverId);
+        routeStops = route is null
+            ? []
+            : snapshot.Jobs
+                .SelectMany(j => j.Stops.Where(s => s.RouteId == route.Id).Select(s => (Stop: s, Job: j)))
+                .OrderBy(x => x.Stop.Sequence)
+                .ToList();
+
+        alerts = BuildAlerts();
+    }
+
+    private List<Alert> BuildAlerts()
+    {
+        var list = new List<Alert>();
+        var jobs = snapshot.Jobs.Where(j => InZone(j.ZoneId)).ToList();
+
+        foreach (var j in jobs.Where(j => j.NeedsReview && j.Dropoff is not null))
+        {
+            var reason = j.Stops.FirstOrDefault(s => s.Status == StopStatus.Failed)?.FailureReason ?? "no reason given";
+            list.Add(new Alert($"f{j.Id}", $"{j.Ref} failed: {reason}", true, j.Dropoff!.Lat, j.Dropoff.Lng, j.DriverId, j.Id));
+        }
+        foreach (var j in jobs.Where(j => j.Status == JobStatus.Unassigned && j.Type == JobType.OnDemand
+                                          && nowUtc - j.CreatedAt > TimeSpan.FromMinutes(30) && j.Dropoff is not null))
+        {
+            list.Add(new Alert($"w{j.Id}", $"{j.Ref} unassigned for {FormatAge(nowUtc - j.CreatedAt)}", true, j.Dropoff!.Lat, j.Dropoff.Lng, null, j.Id));
+        }
+        foreach (var j in jobs.Where(j => !j.NeedsReview && j.WindowEnd is { } end && end < nowUtc && j.Dropoff is not null))
+        {
+            list.Add(new Alert($"l{j.Id}", $"{j.Ref} past window (ended {Clock.ToLocal(j.WindowEnd!.Value):h:mm tt})", true,
+                j.Dropoff!.Lat, j.Dropoff.Lng, j.DriverId, j.Id));
+        }
+        foreach (var d in visibleDrivers.Where(d => IsStale(d) && d.Lat is not null))
+        {
+            var text = d.LastPingAt is { } p ? $"{d.Name}: no GPS for {FormatAge(nowUtc - p)}" : $"{d.Name}: no GPS yet";
+            list.Add(new Alert($"g{d.Id}", text, false, d.Lat!.Value, d.Lng!.Value, d.Id, null));
+        }
+        return list;
+    }
+
+    private bool InZone(int? zoneId) => zoneFilter == 0 || zoneId == zoneFilter;
+
+    private bool IsStale(MapDriverVm d) =>
+        d.Status != DriverStatus.Offline && (d.LastPingAt is null || nowUtc - d.LastPingAt.Value > TimeSpan.FromMinutes(5));
+
+    private int ActiveJobCount(int driverId) =>
+        snapshot.Jobs.Count(j => j.DriverId == driverId && (j.Status == JobStatus.Assigned || j.Status == JobStatus.InProgress));
+
+    private string JobColor(MapJobVm j)
+    {
+        if (j.Type != JobType.OnDemand) return "#64748b";
+        var minutes = (nowUtc - j.CreatedAt).TotalMinutes;
+        return minutes > 30 ? "#dc2626" : minutes > 15 ? "#f59e0b" : "#ea580c";
+    }
+
+    private static string FormatAge(TimeSpan span)
+    {
+        if (span < TimeSpan.Zero) span = TimeSpan.Zero;
+        if (span.TotalMinutes < 1) return $"{(int)span.TotalSeconds}s";
+        if (span.TotalMinutes < 60) return $"{(int)span.TotalMinutes}m";
+        return $"{(int)span.TotalHours}h {span.Minutes}m";
+    }
+
+    private static string Initials(string name) =>
+        string.Concat(name.Split(' ', StringSplitOptions.RemoveEmptyEntries).Take(2).Select(p => char.ToUpperInvariant(p[0])));
+}

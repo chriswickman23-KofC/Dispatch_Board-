@@ -1,0 +1,160 @@
+@using Dispatch.Shared
+@using Dispatch.Web.Services
+@using Dispatch.Web.Services.Routing
+@inject RoutePlanningService Planning
+@inject DispatchClock Clock
+
+<div class="dd-backdrop" @onmousedown="Close">
+    <div class="dd-dialog dd-wide" @onmousedown:stopPropagation>
+        <div class="dd-head">
+            <div>
+                <h2>Plan the day</h2>
+                <div class="dd-steps">@ZoneName · assigns unassigned jobs and orders every route</div>
+            </div>
+            <button class="dd-x" @onclick="Close">✕</button>
+        </div>
+
+        <div class="dd-body">
+            @if (error is not null)
+            {
+                <p class="dd-error">@error</p>
+            }
+
+            @if (loading)
+            {
+                <div class="dd-progress"><p>Planning routes… this usually takes a few seconds.</p></div>
+            }
+            else if (applied is not null)
+            {
+                <div class="dd-done">
+                    <div class="big">✓</div>
+                    <p><b>@applied.Assigned jobs assigned and routes reordered.</b></p>
+                    @if (applied.Problems.Count > 0)
+                    {
+                        <p class="dim">Some changes were skipped because the board changed while you were reviewing:</p>
+                        <ul class="pd-problems">
+                            @foreach (var p in applied.Problems) { <li>@p</li> }
+                        </ul>
+                    }
+                </div>
+            }
+            else if (plan is not null)
+            {
+                <div class="dd-chips">
+                    <span class="chip ok">✓ @NewJobCount jobs planned across @plan.Routes.Count(r => r.NewJobIds.Count > 0) drivers</span>
+                    @if (LateCount > 0) { <span class="chip check">⚠ @LateCount stops after their window</span> }
+                    @if (plan.Unplanned.Count > 0) { <span class="chip error">✕ @plan.Unplanned.Count couldn't be planned</span> }
+                </div>
+
+                @if (Stale)
+                {
+                    <p class="dd-note">This plan is over 10 minutes old. Consider re-planning before applying.</p>
+                }
+
+                <div class="pd-routes">
+                    @foreach (var r in plan.Routes)
+                    {
+                        <div class="pd-route">
+                            <div class="dd-row">
+                                <strong>@r.DriverName</strong>
+                                <span class="dim small">@r.Stops.Count stops · @Hours(r.TotalTime) · @Miles(r.DistanceMeters)</span>
+                            </div>
+                            @if (r.NewJobIds.Count > 0)
+                            {
+                                <div class="pd-new">+@r.NewJobIds.Count new job@(r.NewJobIds.Count == 1 ? "" : "s")</div>
+                            }
+                            <ol class="pd-stops">
+                                @foreach (var s in r.Stops)
+                                {
+                                    <li class="@(s.IsNewJob ? "new" : "")">
+                                        <span class="pd-time @(s.Late ? "late" : "")">@Clock.ToLocal(s.Eta).ToString("h:mm tt")</span>
+                                        <span>@(s.Kind == StopKind.Pickup ? "↑" : "↓") @s.JobRef · @s.Address</span>
+                                        @if (s.IsNewJob) { <span class="pd-badge">NEW</span> }
+                                        @if (s.Late) { <span class="pd-late">late</span> }
+                                    </li>
+                                }
+                            </ol>
+                        </div>
+                    }
+                </div>
+
+                @if (plan.Unplanned.Count > 0)
+                {
+                    <h3>Couldn't be planned</h3>
+                    <p class="dd-note">Usually because no driver can reach them within their delivery window or before the end of the day. Assign these by hand or reschedule them.</p>
+                    <ul class="pd-unplanned">
+                        @foreach (var j in plan.Unplanned)
+                        {
+                            <li><b>@j.Ref</b> · @j.DisplayName · @j.DropoffAddress</li>
+                        }
+                    </ul>
+                }
+            }
+        </div>
+
+        <div class="dd-actions spread">
+            <div>
+                @if (!loading && applied is null)
+                {
+                    <button class="dd-btn" disabled="@applying" @onclick="ProposeAsync">↻ Re-plan</button>
+                }
+            </div>
+            <div>
+                @if (applied is not null)
+                {
+                    <button class="dd-btn primary" @onclick="Close">Close</button>
+                }
+                else
+                {
+                    <button class="dd-btn" @onclick="Close">Cancel</button>
+                    <button class="dd-btn primary" disabled="@(plan is null || applying || plan.Routes.Count == 0)" @onclick="ApplyAsync">
+                        @(applying ? "Applying…" : "Apply plan")
+                    </button>
+                }
+            </div>
+        </div>
+    </div>
+</div>
+
+@code {
+    [Parameter] public int? ZoneId { get; set; }
+    [Parameter] public string ZoneName { get; set; } = "All zones";
+    [Parameter, EditorRequired] public Actor Actor { get; set; } = default!;
+    [Parameter] public EventCallback OnClose { get; set; }
+
+    private PlanProposal? plan;
+    private PlanApplyResult? applied;
+    private string? error;
+    private bool loading;
+    private bool applying;
+
+    private int NewJobCount => plan?.Routes.Sum(r => r.NewJobIds.Count) ?? 0;
+    private int LateCount => plan?.Routes.Sum(r => r.Stops.Count(s => s.Late)) ?? 0;
+    private bool Stale => plan is not null && DateTimeOffset.UtcNow - plan.CreatedAt > TimeSpan.FromMinutes(10);
+
+    protected override Task OnInitializedAsync() => ProposeAsync();
+
+    private async Task ProposeAsync()
+    {
+        loading = true;
+        error = null;
+        plan = null;
+        var result = await Planning.ProposeDayPlanAsync(ZoneId);
+        loading = false;
+        if (result.Success) plan = result.Value;
+        else error = result.Error;
+    }
+
+    private async Task ApplyAsync()
+    {
+        if (plan is null) return;
+        applying = true;
+        applied = await Planning.ApplyPlanAsync(plan, Actor);
+        applying = false;
+    }
+
+    private Task Close() => OnClose.InvokeAsync();
+
+    private static string Hours(TimeSpan t) => t.TotalHours >= 1 ? $"{(int)t.TotalHours}h {t.Minutes}m" : $"{t.Minutes}m";
+    private static string Miles(double meters) => $"{meters / 1609.34:0.#} mi";
+}

@@ -1,0 +1,170 @@
+@page "/dispatch/settings"
+@layout Dispatch.Web.Components.Layout.BoardLayout
+@rendermode @(new InteractiveServerRenderMode(prerender: false))
+@attribute [Authorize(Roles = Roles.DispatchStaff)]
+
+@using System.Security.Claims
+@using Dispatch.Shared
+@using Dispatch.Web.Services
+@using Dispatch.Web.Services.Calendar
+@using Microsoft.AspNetCore.Authorization
+
+@inject ClosedDayService ClosedDays
+@inject DeliveryCalendar Calendar
+@inject BoardQueries Profiles
+@inject DispatchClock Clock
+
+<PageTitle>Settings · Dispatch</PageTitle>
+
+<div class="admin">
+    <header class="topbar">
+        <a class="back" href="/dispatch">‹ Board</a>
+        <span class="brand">Settings</span>
+    </header>
+
+    <main class="content">
+        @if (message is not null)
+        {
+            <div class="message @(messageIsError ? "error" : "")">
+                @message
+                <button class="close" @onclick="() => message = null">✕</button>
+            </div>
+        }
+
+        <section class="panel">
+            <h2>Delivery days</h2>
+            <p>
+                Regular delivery days:
+                <strong>@string.Join(", ", WeekOrder.Where(d => Calendar.WeeklyDays.Contains(d)).Select(d => d.ToString()[..3]))</strong>
+            </p>
+            <p class="dim small">Weekly days are set in the app's configuration (<code>Intake:DeliveryDays</code>). Use closed days below for holidays and one-off closures.</p>
+        </section>
+
+        <section class="panel">
+            <h2>Closed days</h2>
+            <p class="dim small">
+                Online orders skip closed days automatically. Dispatchers see a warning when scheduling a job,
+                importing a CSV, or rescheduling onto a closed day, but can still save for special cases.
+            </p>
+
+            @if (nextYearMissing)
+            {
+                <div class="reminder">
+                    Next year's holidays haven't been added yet.
+                    <button class="link-btn" disabled="@busy" @onclick="() => AddStandardAsync(thisYear + 1)">Add @(thisYear + 1) holidays</button>
+                </div>
+            }
+
+            <div class="add-row">
+                <input type="date" @bind="newDate" min="@Clock.Today.ToString("yyyy-MM-dd")" />
+                <input class="name-input" placeholder="Name, e.g. Staff holiday" maxlength="80" @bind="newName" @bind:event="oninput" />
+                <button class="btn primary" disabled="@(busy || newDate is null || string.IsNullOrWhiteSpace(newName))" @onclick="AddAsync">Close this day</button>
+            </div>
+
+            <div class="add-row">
+                <button class="btn light" disabled="@busy" @onclick="() => AddStandardAsync(thisYear)">Add standard holidays for @thisYear</button>
+                <button class="btn light" disabled="@busy" @onclick="() => AddStandardAsync(thisYear + 1)">Add standard holidays for @(thisYear + 1)</button>
+                <label class="toggle"><input type="checkbox" @bind="showPast" @bind:after="LoadAsync" /> Show past days</label>
+            </div>
+
+            <table class="grid">
+                <thead>
+                    <tr><th>Date</th><th>Name</th><th>Jobs scheduled</th><th>Added by</th><th></th></tr>
+                </thead>
+                <tbody>
+                    @foreach (var d in days)
+                    {
+                        <tr class="@(d.Date < Clock.Today ? "inactive" : "")">
+                            <td><strong>@d.Date.ToString("ddd, MMM d, yyyy")</strong></td>
+                            <td>@d.Name</td>
+                            <td class="@(d.ScheduledJobs > 0 && d.Date >= Clock.Today ? "warn" : "dim")">
+                                @(d.ScheduledJobs > 0 ? $"{d.ScheduledJobs} — reschedule these" : "None")
+                            </td>
+                            <td class="dim">@(d.CreatedBy ?? "—")</td>
+                            <td class="row-actions">
+                                <button disabled="@busy" @onclick="() => RemoveAsync(d)">Reopen</button>
+                            </td>
+                        </tr>
+                    }
+                    @if (days.Count == 0)
+                    {
+                        <tr><td colspan="5" class="dim">No closed days @(showPast ? "" : "coming up").</td></tr>
+                    }
+                </tbody>
+            </table>
+        </section>
+    </main>
+</div>
+
+@code {
+    [CascadingParameter] private Task<AuthenticationState> AuthState { get; set; } = default!;
+
+    private static readonly DayOfWeek[] WeekOrder =
+        [DayOfWeek.Monday, DayOfWeek.Tuesday, DayOfWeek.Wednesday, DayOfWeek.Thursday, DayOfWeek.Friday, DayOfWeek.Saturday, DayOfWeek.Sunday];
+
+    private List<ClosedDayVm> days = [];
+    private bool showPast;
+    private DateOnly? newDate;
+    private string newName = "";
+    private string actorName = "";
+    private string? message;
+    private bool messageIsError;
+    private bool busy;
+    private bool nextYearMissing;
+    private int thisYear;
+
+    protected override async Task OnInitializedAsync()
+    {
+        thisYear = Clock.Today.Year;
+        var userId = (await AuthState).User.FindFirstValue(ClaimTypes.NameIdentifier)!;
+        actorName = (await Profiles.GetProfileAsync(userId)).FullName;
+        await LoadAsync();
+    }
+
+    private async Task LoadAsync()
+    {
+        days = await ClosedDays.ListAsync(showPast);
+        // From October on, nudge if next year's calendar is still empty
+        nextYearMissing = Clock.Today.Month >= 10 && !await ClosedDays.HasAnyInYearAsync(thisYear + 1);
+    }
+
+    private async Task AddAsync()
+    {
+        if (newDate is not DateOnly date) return;
+        busy = true;
+        var result = await ClosedDays.AddAsync(date, newName, actorName);
+        busy = false;
+
+        Show(result.Success ? result.Value! : result.Error!, !result.Success);
+        if (result.Success)
+        {
+            newDate = null;
+            newName = "";
+            await LoadAsync();
+        }
+    }
+
+    private async Task RemoveAsync(ClosedDayVm day)
+    {
+        busy = true;
+        await ClosedDays.RemoveAsync(day.Id);
+        busy = false;
+        Show($"{day.Date:dddd, MMM d} is open again.", false);
+        await LoadAsync();
+    }
+
+    private async Task AddStandardAsync(int year)
+    {
+        busy = true;
+        var added = await ClosedDays.AddStandardHolidaysAsync(year, actorName);
+        busy = false;
+        Show(added > 0 ? $"Added {added} holidays for {year}." : $"{year}'s standard holidays were already on the calendar.", false);
+        await LoadAsync();
+    }
+
+    private void Show(string text, bool isError)
+    {
+        message = text;
+        messageIsError = isError;
+    }
+}

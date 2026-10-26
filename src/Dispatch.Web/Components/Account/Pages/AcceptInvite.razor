@@ -1,0 +1,137 @@
+@page "/Account/AcceptInvite"
+
+@using System.ComponentModel.DataAnnotations
+@using System.Text
+@using Dispatch.Shared
+@using Dispatch.Web.Data
+@using Microsoft.AspNetCore.Identity
+@using Microsoft.AspNetCore.WebUtilities
+
+@inject UserManager<ApplicationUser> Users
+
+<PageTitle>Set your password</PageTitle>
+
+<h1>Set your password</h1>
+
+@if (done)
+{
+    <div class="alert alert-success">Your password is set.</div>
+    @if (isDriver)
+    {
+        <p>Open the <strong>Courier Driver</strong> app on your company phone and sign in with <strong>@email</strong>.</p>
+    }
+    else
+    {
+        <p><a href="Account/Login">Sign in to the dispatch board</a></p>
+    }
+}
+else if (linkProblem is not null)
+{
+    <div class="alert alert-warning">@linkProblem</div>
+}
+else
+{
+    <div class="row">
+        <div class="col-md-5">
+            <EditForm Model="Input" FormName="accept-invite" OnValidSubmit="SetPasswordAsync" method="post">
+                <DataAnnotationsValidator />
+                <ValidationSummary class="text-danger" role="alert" />
+                <InputText type="hidden" @bind-Value="Input.UserId" />
+                <InputText type="hidden" @bind-Value="Input.Code" />
+
+                <div class="form-floating mb-3">
+                    <InputText type="password" @bind-Value="Input.Password" id="password" class="form-control"
+                               autocomplete="new-password" placeholder="Password" />
+                    <label for="password">New password</label>
+                </div>
+                <div class="form-floating mb-3">
+                    <InputText type="password" @bind-Value="Input.ConfirmPassword" id="confirm" class="form-control"
+                               autocomplete="new-password" placeholder="Confirm password" />
+                    <label for="confirm">Confirm password</label>
+                </div>
+
+                @foreach (var error in errors)
+                {
+                    <div class="text-danger mb-2">@error</div>
+                }
+
+                <button type="submit" class="w-100 btn btn-lg btn-primary">Set password</button>
+            </EditForm>
+            <p class="mt-3 text-muted small">Use at least 6 characters, including an uppercase letter, a lowercase letter, a number, and a symbol.</p>
+        </div>
+    </div>
+}
+
+@code {
+    [SupplyParameterFromQuery] private string? UserId { get; set; }
+    [SupplyParameterFromQuery] private string? Code { get; set; }
+    [SupplyParameterFromForm] private InputModel Input { get; set; } = default!;
+
+    private bool done;
+    private bool isDriver;
+    private string? email;
+    private string? linkProblem;
+    private List<string> errors = [];
+
+    protected override void OnInitialized()
+    {
+        Input ??= new();
+        if (string.IsNullOrEmpty(Input.UserId))
+        {
+            Input.UserId = UserId;
+            Input.Code = Code;
+        }
+        if (string.IsNullOrEmpty(Input.UserId) || string.IsNullOrEmpty(Input.Code))
+            linkProblem = "This link is incomplete. Please use the link from your email.";
+    }
+
+    private async Task SetPasswordAsync()
+    {
+        var user = await Users.FindByIdAsync(Input.UserId ?? "");
+        if (user is null)
+        {
+            linkProblem = "This invite is no longer valid. Ask dispatch to send a new one.";
+            return;
+        }
+
+        string token;
+        try { token = Encoding.UTF8.GetString(WebEncoders.Base64UrlDecode(Input.Code ?? "")); }
+        catch (FormatException)
+        {
+            linkProblem = "This link is damaged. Please use the link from your email.";
+            return;
+        }
+
+        var result = await Users.ResetPasswordAsync(user, token, Input.Password);
+        if (!result.Succeeded)
+        {
+            if (result.Errors.Any(e => e.Code == "InvalidToken"))
+                linkProblem = "This link has expired or was already used. Ask dispatch to send a new one.";
+            else
+                errors = result.Errors.Select(e => e.Description).ToList();
+            return;
+        }
+
+        if (!user.EmailConfirmed)
+        {
+            user.EmailConfirmed = true;   // accepting the invite proves they own the address
+            await Users.UpdateAsync(user);
+        }
+
+        isDriver = await Users.IsInRoleAsync(user, Roles.Driver);
+        email = user.Email;
+        done = true;
+    }
+
+    private sealed class InputModel
+    {
+        public string? UserId { get; set; }
+        public string? Code { get; set; }
+
+        [Required, StringLength(100, MinimumLength = 6), DataType(DataType.Password)]
+        public string Password { get; set; } = "";
+
+        [DataType(DataType.Password), Compare(nameof(Password), ErrorMessage = "The passwords don't match.")]
+        public string ConfirmPassword { get; set; } = "";
+    }
+}

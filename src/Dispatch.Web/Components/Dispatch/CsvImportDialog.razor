@@ -1,0 +1,478 @@
+@using System.Text.Json
+@using Dispatch.Shared
+@using Dispatch.Web.Services
+@using Dispatch.Web.Services.Calendar
+@inject ClientService Clients
+@inject MapboxGeocoder Geocoder
+@inject DispatchService Dispatch
+@inject DeliveryCalendar Calendar
+@inject DispatchClock Clock
+
+@* Deliberately ignores Escape and backdrop clicks, so a stray keypress can't throw away a half-reviewed import *@
+<div class="dd-backdrop">
+    <div class="dd-dialog dd-wide">
+        <div class="dd-head">
+            <div>
+                <h2>Import jobs from CSV</h2>
+                <div class="dd-steps">
+                    <span class="@(step == Step.Upload ? "on" : "")">1. Upload</span> →
+                    <span class="@(step == Step.Map ? "on" : "")">2. Match columns</span> →
+                    <span class="@(step == Step.Review ? "on" : "")">3. Review</span>
+                </div>
+            </div>
+            <button class="dd-x" @onclick="OnClose">✕</button>
+        </div>
+
+        <div class="dd-body">
+            @if (error is not null)
+            {
+                <p class="dd-error">@error</p>
+            }
+
+            @if (step == Step.Upload)
+            {
+                <div class="dd-grid">
+                    <label>Client
+                        <select @bind="clientId">
+                            <option value="">No client / mixed</option>
+                            @foreach (var c in clients)
+                            {
+                                <option value="@c.Id">@c.Name@(c.CsvMapping is null ? "" : " (layout saved)")</option>
+                            }
+                        </select>
+                        <small>Choosing a client fills in their pickup and remembers their column layout.</small>
+                    </label>
+                    <label>Zone for these jobs
+                        <select @bind="zoneId">
+                            <option value="">No zone</option>
+                            @foreach (var z in Zones)
+                            {
+                                <option value="@z.Id">@z.Name</option>
+                            }
+                        </select>
+                    </label>
+                </div>
+
+                <fieldset class="dd-defaults">
+                    <legend>Rows without a date or time are…</legend>
+                    <label>
+                        <input type="radio" name="defaultType" checked="@(defaultType == JobType.Scheduled)"
+                               @onchange="() => defaultType = JobType.Scheduled" />
+                        Scheduled for <input type="date" @bind="defaultDate" @bind:after="CheckDefaultDateAsync" />
+                    </label>
+                    <label>
+                        <input type="radio" name="defaultType" checked="@(defaultType == JobType.OnDemand)"
+                               @onchange="() => defaultType = JobType.OnDemand" />
+                        On-demand (ASAP)
+                    </label>
+                </fieldset>
+                @if (defaultDateWarning is not null && defaultType == JobType.Scheduled)
+                {
+                    <p class="dd-warn">⚠ @defaultDateWarning</p>
+                }
+
+                <label class="dd-drop">
+                    <InputFile OnChange="OnFileAsync" accept=".csv,text/csv" class="dd-hidden" />
+                    <strong>Choose a CSV file</strong>
+                    <small>Up to @CsvImportLogic.MaxRows rows, with a header row</small>
+                </label>
+            }
+            else if (step == Step.Map)
+            {
+                <p><b>@fileName</b> · @rawRows.Count rows. Check each field points at the right column.</p>
+                <div class="dd-mapgrid">
+                    @foreach (var f in CsvImportLogic.Fields)
+                    {
+                        var current = mapping.GetValueOrDefault(f.Key);
+                        <span>@f.Label @if (f.Required) { <b class="req">*</b> }</span>
+                        <select class="@(current is null ? "" : "mapped")" value="@(current ?? "")"
+                                @onchange="e => SetMapping(f.Key, e.Value?.ToString())">
+                            <option value="">— not in file —</option>
+                            @foreach (var h in headers)
+                            {
+                                <option value="@h">@h</option>
+                            }
+                        </select>
+                    }
+                </div>
+
+                @if (mapping.GetValueOrDefault("pickup_address") is null)
+                {
+                    <p class="dd-note">
+                        @(SelectedClient?.DefaultPickup is { } p
+                            ? $"No pickup column, so every job picks up at {SelectedClient.Name}: {p.Address}."
+                            : "No pickup column and no client default pickup. Match a pickup column or go back and choose a client.")
+                    </p>
+                }
+
+                <h3>Preview (first 3 rows)</h3>
+                <table class="dd-table">
+                    <thead><tr><th>Recipient</th><th>Dropoff</th><th>When</th><th>Order #</th></tr></thead>
+                    <tbody>
+                        @foreach (var r in rawRows.Take(3).Select((raw, i) => CsvImportLogic.BuildRow(raw, i, mapping, defaultType, defaultDate)))
+                        {
+                            <tr>
+                                <td>@(r.RecipientName ?? "—")</td>
+                                <td>@(r.DropoffText.Length > 0 ? r.DropoffText : "missing")</td>
+                                <td>@When(r)</td>
+                                <td>@(r.ExternalId ?? "—")</td>
+                            </tr>
+                        }
+                    </tbody>
+                </table>
+            }
+            else if (step == Step.Review && progress is { } prog)
+            {
+                <div class="dd-progress">
+                    <p>Locating addresses… @prog.Done / @prog.Total</p>
+                    <div class="bar"><div style="width:@(prog.Total == 0 ? 0 : prog.Done * 100 / prog.Total)%"></div></div>
+                </div>
+            }
+            else if (step == Step.Review)
+            {
+                <div class="dd-chips">
+                    <span class="chip ok">✓ @rows.Count(r => r.Status == RowStatus.Ok) ready</span>
+                    <span class="chip check">⚠ @rows.Count(r => r.Status == RowStatus.Check) worth a look</span>
+                    <span class="chip error">✕ @rows.Count(r => r.Status == RowStatus.Error) need fixing</span>
+                </div>
+                @if (rows.Any(r => r.Status == RowStatus.Error))
+                {
+                    <p class="dd-note">Addresses can be fixed here. Bad dates or times need fixing in the file and re-uploading, or those rows will be skipped.</p>
+                }
+                @if (rows.Count(r => r.ClosedReason is not null) is var closedCount and > 0)
+                {
+                    <div class="dd-warn">
+                        ⚠ @closedCount row@(closedCount == 1 ? "" : "s") fall on closed days.
+                        <button class="dd-link" @onclick="MoveAllClosedRowsAsync">Move them to the next open day</button>
+                        or import as-is if these are special deliveries.
+                    </div>
+                }
+
+                @if (fixing is not null)
+                {
+                    <div class="dd-fix">
+                        <div class="dd-row"><b>Fix line @fixing.Line</b><button class="dd-link" @onclick="() => fixing = null">Done</button></div>
+                        <small>File says: @(fixing.DropoffText.Length > 0 ? fixing.DropoffText : "(empty)")</small>
+                        <AddressAutocomplete @key="@($"fix-d-{fixing.Line}")" Label="Dropoff address"
+                                             Value="fixing.Dropoff"
+                                             InitialText="@(fixing.Dropoff is null ? fixing.DropoffText : null)"
+                                             ValueChanged="v => FixDropoff(v)" />
+                        @if (fixing.PickupText.Length > 0 || fixing.Pickup is null)
+                        {
+                            <AddressAutocomplete @key="@($"fix-p-{fixing.Line}")" Label="Pickup address"
+                                                 Value="fixing.Pickup"
+                                                 InitialText="@(fixing.Pickup is null ? fixing.PickupText : null)"
+                                                 ValueChanged="v => FixPickup(v)" />
+                        }
+                    </div>
+                }
+
+                <table class="dd-table">
+                    <thead><tr><th></th><th>Line</th><th>Recipient / Order</th><th>Dropoff</th><th>When</th><th>Status</th></tr></thead>
+                    <tbody>
+                        @foreach (var r in rows)
+                        {
+                            var st = r.Status;
+                            <tr class="@(r == fixing ? "fixing" : "")">
+                                <td>
+                                    <input type="checkbox" disabled="@(st == RowStatus.Error)"
+                                           checked="@(r.Include && st != RowStatus.Error)"
+                                           @onchange="e => r.Include = (bool)e.Value!" />
+                                </td>
+                                <td class="dim">@r.Line</td>
+                                <td>@(r.RecipientName ?? "—")@if (r.ExternalId is not null) { <div class="dim">#@r.ExternalId</div> }</td>
+                                <td>
+                                    @(r.Dropoff?.Address ?? (r.DropoffText.Length > 0 ? r.DropoffText : "missing"))
+                                    @if (r.LowConfidence && r.Dropoff is not null) { <div class="warn">File: @r.DropoffText</div> }
+                                </td>
+                                <td>
+                                    @When(r)
+                                    @if (r.ClosedReason is not null) { <div class="warn">Closed: @r.ClosedReason</div> }
+                                </td>
+                                <td>
+                                    <span class="chip @st.ToString().ToLowerInvariant()">@(st switch { RowStatus.Ok => "Ready", RowStatus.Check => "Check", _ => "Error" })</span>
+                                    @foreach (var issue in r.Issues)
+                                    {
+                                        <div class="bad">@issue</div>
+                                    }
+                                    @if (st != RowStatus.Ok)
+                                    {
+                                        <button class="dd-link" @onclick="() => fixing = r">Fix</button>
+                                    }
+                                    @if (r.LowConfidence)
+                                    {
+                                        <button class="dd-link good" @onclick="() => r.LowConfidence = false">Looks right</button>
+                                    }
+                                    @if (r.ClosedReason is not null)
+                                    {
+                                        <button class="dd-link" @onclick="() => MoveToOpenDayAsync(r)">Next open day</button>
+                                    }
+                                </td>
+                            </tr>
+                        }
+                    </tbody>
+                </table>
+            }
+            else if (step == Step.Done && result is not null)
+            {
+                <div class="dd-done">
+                    <div class="big">✓</div>
+                    <p><b>@result.Created jobs created</b></p>
+                    @if (result.Skipped > 0)
+                    {
+                        <p class="dim">@result.Skipped skipped because their order # was already imported</p>
+                    }
+                    @if (SelectedClient is not null)
+                    {
+                        <p class="dim">Column layout saved for @SelectedClient.Name.</p>
+                    }
+                </div>
+            }
+        </div>
+
+        <div class="dd-actions spread">
+            <div>
+                @if (step == Step.Map) { <button class="dd-btn" @onclick="() => step = Step.Upload">Back</button> }
+                @if (step == Step.Review && progress is null) { <button class="dd-btn" @onclick="BackToMapping">Back to columns</button> }
+            </div>
+            <div>
+                @if (step == Step.Done)
+                {
+                    <button class="dd-btn primary" @onclick="OnClose">Close</button>
+                }
+                else
+                {
+                    <button class="dd-btn" @onclick="OnClose">Cancel</button>
+                }
+                @if (step == Step.Map)
+                {
+                    <button class="dd-btn primary" @onclick="CheckAddressesAsync">Check addresses</button>
+                }
+                @if (step == Step.Review && progress is null)
+                {
+                    var ready = Ready.Count;
+                    var flagged = Ready.Count(r => r.Status == RowStatus.Check);
+                    <button class="dd-btn primary" disabled="@(busy || ready == 0)" @onclick="ImportAsync">
+                        @(busy ? "Importing…" : $"Import {ready} jobs{(flagged > 0 ? $" ({flagged} flagged)" : "")}")
+                    </button>
+                }
+            </div>
+        </div>
+    </div>
+</div>
+
+@code {
+    private enum Step { Upload, Map, Review, Done }
+
+    [Parameter] public IReadOnlyList<ZoneVm> Zones { get; set; } = [];
+    [Parameter] public int? DefaultZoneId { get; set; }
+    [Parameter, EditorRequired] public Actor Actor { get; set; } = default!;
+    [Parameter] public EventCallback OnClose { get; set; }
+    [Parameter] public EventCallback<ImportResult> OnImported { get; set; }
+
+    private Step step = Step.Upload;
+    private List<ClientVm> clients = [];
+    private int? clientId;
+    private int? zoneId;
+    private JobType defaultType = JobType.Scheduled;
+    private DateOnly defaultDate;
+    private string? defaultDateWarning;
+    private string fileName = "";
+    private List<string> headers = [];
+    private List<Dictionary<string, string>> rawRows = [];
+    private Dictionary<string, string?> mapping = [];
+    private List<ImportRow> rows = [];
+    private (int Done, int Total)? progress;
+    private ImportRow? fixing;
+    private string? error;
+    private bool busy;
+    private ImportResult? result;
+
+    private ClientVm? SelectedClient => clients.FirstOrDefault(c => c.Id == clientId);
+    private List<ImportRow> Ready => rows.Where(r => r.Include && r.Status != RowStatus.Error).ToList();
+
+    protected override async Task OnInitializedAsync()
+    {
+        clients = await Clients.GetActiveAsync();
+        zoneId = DefaultZoneId;
+        defaultDate = Clock.Today;
+        await CheckDefaultDateAsync();
+    }
+
+    private async Task CheckDefaultDateAsync() =>
+        defaultDateWarning = await Calendar.ClosedReasonAsync(defaultDate) is { } reason
+            ? $"{defaultDate:dddd, MMM d}: {reason}. Rows without their own date will be flagged."
+            : null;
+
+    private async Task OnFileAsync(InputFileChangeEventArgs e)
+    {
+        error = null;
+        try
+        {
+            await using var buffer = new MemoryStream();
+            await e.File.OpenReadStream(maxAllowedSize: 5 * 1024 * 1024).CopyToAsync(buffer);
+            buffer.Position = 0;
+            (headers, rawRows) = CsvImportLogic.Read(buffer);
+        }
+        catch (Exception ex)
+        {
+            error = $"Couldn't read that file: {ex.Message}";
+            return;
+        }
+
+        if (headers.Count == 0 || rawRows.Count == 0)
+        {
+            error = "That file has no header row or no data rows.";
+            return;
+        }
+        if (rawRows.Count > CsvImportLogic.MaxRows)
+        {
+            error = $"That file has more than {CsvImportLogic.MaxRows} rows. Split it into smaller files.";
+            return;
+        }
+
+        fileName = e.File.Name;
+        var saved = SelectedClient?.CsvMapping is { } json
+            ? JsonSerializer.Deserialize<Dictionary<string, string>>(json)
+            : null;
+        mapping = CsvImportLogic.Guess(headers, saved);
+        step = Step.Map;
+    }
+
+    private void SetMapping(string key, string? header) =>
+        mapping[key] = string.IsNullOrEmpty(header) ? null : header;
+
+    private async Task CheckAddressesAsync()
+    {
+        if (mapping.GetValueOrDefault("dropoff_address") is null)
+        {
+            error = "Match the dropoff address column first.";
+            return;
+        }
+        var clientPickup = SelectedClient?.DefaultPickup;
+        if (mapping.GetValueOrDefault("pickup_address") is null && clientPickup is null)
+        {
+            error = "Match a pickup column, or go back and choose a client with a default pickup address.";
+            return;
+        }
+
+        error = null;
+        step = Step.Review;
+        rows = rawRows.Select((r, i) => CsvImportLogic.BuildRow(r, i, mapping, defaultType, defaultDate)).ToList();
+
+        var texts = rows.SelectMany(r => new[] { r.DropoffText, r.PickupText })
+            .Where(t => !string.IsNullOrWhiteSpace(t)).Distinct().ToList();
+        var found = new Dictionary<string, GeoSuggestion?>();
+        progress = (0, texts.Count);
+
+        try
+        {
+            for (var i = 0; i < texts.Count; i += 100)
+            {
+                var chunk = texts.Skip(i).Take(100).ToList();
+                var results = await Geocoder.LocateBatchAsync(chunk);
+                for (var j = 0; j < chunk.Count; j++) found[chunk[j]] = j < results.Count ? results[j] : null;
+                progress = (Math.Min(i + 100, texts.Count), texts.Count);
+                StateHasChanged();
+            }
+        }
+        catch (Exception ex)
+        {
+            error = $"Address lookup failed: {ex.Message}";
+            progress = null;
+            step = Step.Map;
+            return;
+        }
+
+        static GeoPoint? ToPoint(GeoSuggestion? g) => g is null ? null : new GeoPoint(g.Address, g.Lat, g.Lng);
+        static bool Unsure(GeoSuggestion? g) => g?.Confidence is "low" or "medium";
+
+        foreach (var r in rows)
+        {
+            var drop = r.DropoffText.Length > 0 ? found.GetValueOrDefault(r.DropoffText) : null;
+            var pick = r.PickupText.Length > 0 ? found.GetValueOrDefault(r.PickupText) : null;
+            r.Dropoff = ToPoint(drop);
+            r.Pickup = r.PickupText.Length > 0 ? ToPoint(pick) : clientPickup;
+            r.LowConfidence = Unsure(drop) || Unsure(pick);
+        }
+
+        foreach (var r in rows.Where(r => r.Type == JobType.Scheduled && r.ScheduledDate is not null))
+            r.ClosedReason = await Calendar.ClosedReasonAsync(r.ScheduledDate!.Value);
+
+        progress = null;
+    }
+
+    private void FixDropoff(GeoPoint? value)
+    {
+        if (fixing is null) return;
+        fixing.Dropoff = value;
+        fixing.LowConfidence = false;
+    }
+
+    private void FixPickup(GeoPoint? value)
+    {
+        if (fixing is null) return;
+        fixing.Pickup = value;
+        fixing.LowConfidence = false;
+    }
+
+    private async Task MoveToOpenDayAsync(ImportRow row)
+    {
+        if (row.ScheduledDate is not DateOnly d) return;
+        row.ScheduledDate = await Calendar.NextOpenDayAsync(d);
+        row.ClosedReason = null;
+    }
+
+    private async Task MoveAllClosedRowsAsync()
+    {
+        foreach (var row in rows.Where(r => r.ClosedReason is not null).ToList())
+            await MoveToOpenDayAsync(row);
+    }
+
+    private void BackToMapping()
+    {
+        fixing = null;
+        step = Step.Map;
+    }
+
+    private async Task ImportAsync()
+    {
+        busy = true;
+        error = null;
+
+        DateTimeOffset? Utc(ImportRow r, TimeOnly? t) =>
+            r.Type == JobType.Scheduled && r.ScheduledDate is { } d && t is { } time ? Clock.ToUtc(d, time) : null;
+
+        var jobs = Ready.Select(r => new NewJob(
+            r.Type, r.Pickup!, r.Dropoff!,
+            RecipientName: r.RecipientName,
+            RecipientPhone: r.RecipientPhone,
+            ScheduledDate: r.ScheduledDate,
+            WindowStart: Utc(r, r.Start),
+            WindowEnd: Utc(r, r.End),
+            Notes: r.Notes,
+            ExternalId: r.ExternalId)).ToList();
+
+        var res = await Dispatch.ImportJobsAsync(clientId, zoneId, jobs, Actor);
+        busy = false;
+        if (!res.Success)
+        {
+            error = res.Error;
+            return;
+        }
+
+        if (clientId is int id)
+        {
+            var layout = mapping.Where(kv => kv.Value is not null).ToDictionary(kv => kv.Key, kv => kv.Value!);
+            await Clients.SaveCsvMappingAsync(id, JsonSerializer.Serialize(layout));
+        }
+
+        result = res.Value;
+        step = Step.Done;
+        await OnImported.InvokeAsync(result!);
+    }
+
+    private static string When(ImportRow r) =>
+        r.Type == JobType.OnDemand ? "ASAP"
+        : $"{r.ScheduledDate:MMM d}{(r.Start is { } s ? $" {s:h:mm tt}–{r.End:h:mm tt}" : "")}";
+}

@@ -1,0 +1,184 @@
+@using Dispatch.Shared
+@using Dispatch.Web.Data
+@using Dispatch.Web.Services
+@using Dispatch.Web.Services.Calendar
+@inject DispatchService Dispatch
+@inject ClientService Clients
+@inject DeliveryCalendar Calendar
+@inject DispatchClock Clock
+
+<div class="dd-backdrop" @onmousedown="OnClose">
+    <div class="dd-dialog" @onmousedown:stopPropagation @onkeydown="OnKeyDownAsync">
+        <div class="dd-head">
+            <h2>New job</h2>
+            <button class="dd-x" @onclick="OnClose">✕</button>
+        </div>
+
+        <div class="dd-toggle">
+            <button class="@(type == JobType.OnDemand ? "on" : "")" @onclick="async () => { type = JobType.OnDemand; await CheckClosedAsync(); }">⚡ On-demand</button>
+            <button class="@(type == JobType.Scheduled ? "on" : "")" @onclick="async () => { type = JobType.Scheduled; await CheckClosedAsync(); }">🕒 Scheduled</button>
+        </div>
+
+        <div class="dd-grid">
+            <label>Client
+                <select @bind="clientId" @bind:after="ApplyClientPickup">
+                    <option value="">No client / one-off</option>
+                    @foreach (var c in clients)
+                    {
+                        <option value="@c.Id">@c.Name</option>
+                    }
+                </select>
+            </label>
+            <label>Zone
+                <select @bind="zoneId">
+                    <option value="">No zone</option>
+                    @foreach (var z in Zones)
+                    {
+                        <option value="@z.Id">@z.Name</option>
+                    }
+                </select>
+            </label>
+        </div>
+
+        <AddressAutocomplete @key="@($"pickup-{formKey}")" Label="Pickup address" Placeholder="Start typing an address…" @bind-Value="pickup" />
+        <AddressAutocomplete @key="@($"dropoff-{formKey}")" Label="Dropoff address" Placeholder="Start typing an address…" @bind-Value="dropoff" />
+
+        <div class="dd-grid">
+            <label>Recipient name <input @bind="recipientName" /></label>
+            <label>Recipient phone <input type="tel" @bind="recipientPhone" placeholder="For delivery texts" /></label>
+        </div>
+
+        @if (type == JobType.Scheduled)
+        {
+            <div class="dd-grid three">
+                <label>Date <input type="date" @bind="date" @bind:after="CheckClosedAsync" /></label>
+                <label>Window start <input type="time" @bind="windowStart" /></label>
+                <label>Window end <input type="time" @bind="windowEnd" /></label>
+            </div>
+        }
+
+        @if (closedWarning is not null)
+        {
+            <p class="dd-warn">⚠ @closedWarning You can still save if this delivery is a special case.</p>
+        }
+
+        <label class="dd-full">Notes for driver
+            <textarea rows="2" @bind="notes" placeholder="Gate code, leave at front desk…"></textarea>
+        </label>
+
+        @if (error is not null)
+        {
+            <p class="dd-error">@error</p>
+        }
+
+        <div class="dd-actions">
+            <button class="dd-btn" @onclick="OnClose">Cancel</button>
+            <button class="dd-btn outline" disabled="@saving" @onclick="() => SaveAsync(addAnother: true)">Save &amp; add another</button>
+            <button class="dd-btn primary" disabled="@saving" @onclick="() => SaveAsync(addAnother: false)">@(saving ? "Saving…" : "Create job")</button>
+        </div>
+    </div>
+</div>
+
+@code {
+    [Parameter] public IReadOnlyList<ZoneVm> Zones { get; set; } = [];
+    [Parameter] public int? DefaultZoneId { get; set; }
+    [Parameter, EditorRequired] public Actor Actor { get; set; } = default!;
+    [Parameter] public EventCallback OnClose { get; set; }
+    [Parameter] public EventCallback<Job> OnCreated { get; set; }
+
+    private List<ClientVm> clients = [];
+    private JobType type = JobType.OnDemand;
+    private int? clientId;
+    private int? zoneId;
+    private GeoPoint? pickup;
+    private GeoPoint? dropoff;
+    private string? recipientName;
+    private string? recipientPhone;
+    private DateOnly date;
+    private TimeOnly? windowStart;
+    private TimeOnly? windowEnd;
+    private string? notes;
+    private string? error;
+    private string? closedWarning;
+    private bool saving;
+    private int formKey;   // bumping this resets the address fields
+
+    protected override async Task OnInitializedAsync()
+    {
+        clients = await Clients.GetActiveAsync();
+        zoneId = DefaultZoneId;
+        date = Clock.Today;
+        await CheckClosedAsync();
+    }
+
+    private void ApplyClientPickup()
+    {
+        if (clients.FirstOrDefault(c => c.Id == clientId)?.DefaultPickup is { } p) pickup = p;
+    }
+
+    private async Task CheckClosedAsync()
+    {
+        var day = type == JobType.Scheduled ? date : Clock.Today;
+        closedWarning = await Calendar.ClosedReasonAsync(day) is { } reason
+            ? type == JobType.Scheduled ? $"{day:dddd, MMM d}: {reason}." : $"Today is marked closed: {reason}."
+            : null;
+    }
+
+    private string? Validate()
+    {
+        if (pickup is null) return "Choose a pickup address from the suggestions.";
+        if (dropoff is null) return "Choose a dropoff address from the suggestions.";
+        if (type == JobType.Scheduled && (windowStart is null) != (windowEnd is null)) return "Enter both window times, or neither.";
+        if (type == JobType.Scheduled && windowStart is { } s && windowEnd is { } e && e <= s) return "Window end must be after start.";
+        if (!string.IsNullOrWhiteSpace(recipientPhone) && recipientPhone.Count(char.IsDigit) < 10) return "Phone number looks incomplete.";
+        return null;
+    }
+
+    private async Task SaveAsync(bool addAnother)
+    {
+        error = Validate();
+        if (error is not null) return;
+        saving = true;
+
+        var scheduled = type == JobType.Scheduled;
+        var result = await Dispatch.CreateJobAsync(new NewJob(
+            type, pickup!, dropoff!,
+            ClientId: clientId,
+            RecipientName: recipientName,
+            RecipientPhone: recipientPhone,
+            ZoneId: zoneId,
+            ScheduledDate: scheduled ? date : null,
+            WindowStart: scheduled && windowStart is { } ws ? Clock.ToUtc(date, ws) : null,
+            WindowEnd: scheduled && windowEnd is { } we ? Clock.ToUtc(date, we) : null,
+            Notes: notes), Actor);
+
+        saving = false;
+        if (!result.Success)
+        {
+            error = result.Error;
+            return;
+        }
+
+        await OnCreated.InvokeAsync(result.Value!);
+        Reset();
+        await CheckClosedAsync();
+        if (!addAnother) await OnClose.InvokeAsync();
+    }
+
+    private void Reset()
+    {
+        type = JobType.OnDemand;
+        clientId = null;
+        pickup = dropoff = null;
+        recipientName = recipientPhone = notes = null;
+        windowStart = windowEnd = null;
+        date = Clock.Today;
+        error = null;
+        formKey++;
+    }
+
+    private async Task OnKeyDownAsync(KeyboardEventArgs e)
+    {
+        if (e.Key == "Escape") await OnClose.InvokeAsync();
+    }
+}

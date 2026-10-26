@@ -1,0 +1,232 @@
+@using Dispatch.Web.Data
+@using Dispatch.Web.Services
+@using Dispatch.Web.Services.Intake
+@inject IntegrationService Integrations
+@inject DispatchClock Clock
+@inject IConfiguration Config
+@inject IJSRuntime JS
+
+<div class="ip">
+    <div class="dd-row">
+        <span class="jd-label">Online orders</span>
+        <div class="ip-add">
+            <button class="dd-link" @onclick="CreateApiKeyAsync">+ Order API key</button>
+            <button class="dd-link" @onclick="() => editing = new IntegrationForm { Kind = IntegrationKind.Shopify }">+ Connect Shopify</button>
+        </div>
+    </div>
+
+    @if (newKey is not null)
+    {
+        <div class="ip-key">
+            <strong>Copy this API key now.</strong> For security it won't be shown again.
+            <div class="ip-code">
+                <code>@newKey</code>
+                <button class="dd-link" @onclick="() => CopyAsync(newKey)">Copy</button>
+            </div>
+            <button class="dd-link" @onclick="() => newKey = null">I've saved it</button>
+        </div>
+    }
+
+    @if (message is not null)
+    {
+        <p class="@(messageIsError ? "dd-error" : "dd-note")">@message</p>
+    }
+
+    @if (items.Count == 0 && editing is null)
+    {
+        <p class="dd-note">No online ordering set up. Orders can still be entered by hand or imported from CSV.</p>
+    }
+
+    @foreach (var i in items)
+    {
+        <div class="ip-item @(i.Active ? "" : "inactive")">
+            <div class="dd-row">
+                <strong>@(i.Kind == IntegrationKind.Shopify ? $"Shopify · {i.ShopDomain}" : $"Order API · {i.ApiKeyPrefix}…")</strong>
+                <span class="ip-actions">
+                    <button class="dd-link" @onclick="() => Edit(i)">Settings</button>
+                    @if (i.Kind == IntegrationKind.Api)
+                    {
+                        <button class="dd-link" @onclick="() => RegenerateAsync(i.Id)">New key</button>
+                    }
+                    <button class="dd-link" @onclick="() => SetActiveAsync(i.Id, !i.Active)">@(i.Active ? "Pause" : "Resume")</button>
+                </span>
+            </div>
+
+            <div class="dim small">
+                @Describe(i)
+                · Last order: @(i.LastOrderAt is { } last ? Clock.ToLocal(last).ToString("MMM d, h:mm tt") : "none yet")
+            </div>
+            @if (i.LastError is not null)
+            {
+                <div class="bad small">Last problem: @i.LastError</div>
+            }
+
+            @if (i.Kind == IntegrationKind.Shopify)
+            {
+                <div class="ip-code small">
+                    <span class="dim">Webhook URL:</span>
+                    <code>@WebhookUrl(i)</code>
+                    <button class="dd-link" @onclick="() => CopyAsync(WebhookUrl(i))">Copy</button>
+                </div>
+            }
+
+            @if (i.Recent.Count > 0)
+            {
+                <table class="dd-table ip-log">
+                    <tbody>
+                        @foreach (var l in i.Recent)
+                        {
+                            <tr>
+                                <td class="dim">@Clock.ToLocal(l.ReceivedAt).ToString("MMM d h:mm tt")</td>
+                                <td><span class="chip @OutcomeClass(l.Outcome)">@l.Outcome</span></td>
+                                <td>@(l.JobRef ?? "")</td>
+                                <td class="dim">@l.Detail</td>
+                            </tr>
+                        }
+                    </tbody>
+                </table>
+            }
+        </div>
+    }
+
+    @if (editing is not null)
+    {
+        <div class="ip-form">
+            @if (editing.Kind == IntegrationKind.Shopify)
+            {
+                <label class="dd-full">Store address <input placeholder="yourstore.myshopify.com" @bind="editing.ShopDomain" /></label>
+                <label class="dd-full">
+                    Webhook signing secret @(editing.Id is null ? "" : "(leave blank to keep the current one)")
+                    <input type="password" autocomplete="off" @bind="editing.NewSecret" />
+                </label>
+
+                <label class="dd-full">Which orders become deliveries
+                    <select @bind="editing.Filter">
+                        <option value="@OrderFilter.AllWithShippingAddress">Every paid order with a shipping address</option>
+                        <option value="@OrderFilter.ShippingMethodContains">Only orders whose shipping method contains…</option>
+                        <option value="@OrderFilter.HasTag">Only orders with the tag…</option>
+                    </select>
+                </label>
+                @if (editing.Filter != OrderFilter.AllWithShippingAddress)
+                {
+                    <label class="dd-full">
+                        @(editing.Filter == OrderFilter.HasTag ? "Tag" : "Shipping method text")
+                        <input placeholder="@(editing.Filter == OrderFilter.HasTag ? "local-delivery" : "Local delivery")" @bind="editing.FilterValue" />
+                    </label>
+                }
+            }
+
+            <div class="dd-grid three">
+                <label>Same-day cutoff <input type="time" @bind="editing.SameDayCutoff" /></label>
+                <label>Default window start <input type="time" @bind="editing.WindowStart" /></label>
+                <label>Default window end <input type="time" @bind="editing.WindowEnd" /></label>
+            </div>
+            <p class="dd-note">Orders received by the cutoff are delivered the same day; later orders go to the next open delivery day.</p>
+
+            <label class="dd-full">Zone for these jobs
+                <select @bind="editing.ZoneId">
+                    <option value="">No zone</option>
+                    @foreach (var z in Zones)
+                    {
+                        <option value="@z.Id">@z.Name</option>
+                    }
+                </select>
+            </label>
+
+            <div class="dd-actions">
+                <button class="dd-btn" @onclick="() => editing = null">Cancel</button>
+                <button class="dd-btn primary" @onclick="SaveAsync">Save</button>
+            </div>
+        </div>
+    }
+</div>
+
+@code {
+    [Parameter, EditorRequired] public int ClientId { get; set; }
+    [Parameter] public IReadOnlyList<ZoneVm> Zones { get; set; } = [];
+
+    private List<IntegrationVm> items = [];
+    private IntegrationForm? editing;
+    private string? newKey;
+    private string? message;
+    private bool messageIsError;
+
+    protected override Task OnParametersSetAsync() => LoadAsync();
+
+    private async Task LoadAsync() => items = await Integrations.ListAsync(ClientId);
+
+    private async Task CreateApiKeyAsync()
+    {
+        var (_, key) = await Integrations.CreateApiKeyAsync(ClientId);
+        newKey = key;
+        await LoadAsync();
+    }
+
+    private async Task RegenerateAsync(int id)
+    {
+        newKey = await Integrations.RegenerateApiKeyAsync(id);
+        Show(newKey is null ? "Couldn't create a new key." : "New key created. The old key no longer works.", newKey is null);
+        await LoadAsync();
+    }
+
+    private async Task SetActiveAsync(int id, bool active)
+    {
+        await Integrations.SetActiveAsync(id, active);
+        Show(active ? "Resumed. New orders will come in again." : "Paused. Incoming orders will be rejected until resumed.", false);
+        await LoadAsync();
+    }
+
+    private void Edit(IntegrationVm i) => editing = new IntegrationForm
+    {
+        Id = i.Id, Kind = i.Kind, ShopDomain = i.ShopDomain, Filter = i.Filter, FilterValue = i.FilterValue,
+        SameDayCutoff = i.SameDayCutoff, WindowStart = i.WindowStart, WindowEnd = i.WindowEnd, ZoneId = i.ZoneId,
+    };
+
+    private async Task SaveAsync()
+    {
+        if (editing is null) return;
+        var result = await Integrations.SaveAsync(ClientId, editing);
+        if (!result.Success)
+        {
+            Show(result.Error!, true);
+            return;
+        }
+        editing = null;
+        Show(result.Value!, false);
+        await LoadAsync();
+    }
+
+    private async Task CopyAsync(string text)
+    {
+        await JS.InvokeVoidAsync("navigator.clipboard.writeText", text);
+        Show("Copied.", false);
+    }
+
+    private void Show(string text, bool isError)
+    {
+        message = text;
+        messageIsError = isError;
+    }
+
+    private string WebhookUrl(IntegrationVm i) =>
+        $"{(Config["App:PublicBaseUrl"] ?? "").TrimEnd('/')}/api/intake/shopify/{i.PublicId}";
+
+    private static string Describe(IntegrationVm i)
+    {
+        var which = i.Kind != IntegrationKind.Shopify ? "" : i.Filter switch
+        {
+            OrderFilter.ShippingMethodContains => $"Shipping method contains \"{i.FilterValue}\" · ",
+            OrderFilter.HasTag => $"Tagged \"{i.FilterValue}\" · ",
+            _ => "All paid orders · ",
+        };
+        var window = i.WindowStart is { } s && i.WindowEnd is { } e ? $" · window {s:h:mm tt}–{e:h:mm tt}" : "";
+        return $"{which}Cutoff {i.SameDayCutoff:h:mm tt}{window}{(i.Active ? "" : " · paused")}";
+    }
+
+    private static string OutcomeClass(string outcome) => outcome switch
+    {
+        "Created" => "ok",
+        "Duplicate" or "Skipped" or "Cancelled" => "check",
+        _ => "error",
+    };
+}

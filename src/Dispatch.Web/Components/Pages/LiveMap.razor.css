@@ -1,0 +1,87 @@
+.live-map {
+    position: fixed;
+    inset: 0;
+    display: flex;
+    flex-direction: column;
+    background: #f1f5f9;
+    font: 14px/1.35 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+.topbar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 12px;
+    padding: 8px 16px;
+    background: #0f172a;
+    color: #fff;
+}
+.brand { font-weight: 600; }
+.dim { color: #94a3b8; }
+.topbar select {
+    background: #1e293b;
+    color: #fff;
+    border: none;
+    border-radius: 4px;
+    padding: 4px 8px;
+}
+
+.chip {
+    background: #2563eb;
+    border-radius: 4px;
+    padding: 2px 8px;
+}
+.chip button {
+    background: none;
+    border: none;
+    color: #fff;
+    opacity: 0.75;
+    cursor: pointer;
+    margin-left: 4px;
+}
+.chip button:hover { opacity: 1; }
+
+.legend {
+    margin-left: auto;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+    font-size: 12px;
+}
+.legend span { display: inline-flex; align-items: center; gap: 4px; }
+.dot { width: 12px; height: 12px; border-radius: 50%; display: inline-block; }
+.dot.available { background: #16a34a; }
+.dot.busy { background: #2563eb; }
+.dot.offline { background: #94a3b8; }
+.dot.stale { border: 2px dashed #ef4444; }
+.diamond { width: 10px; height: 10px; background: #ea580c; transform: rotate(45deg); display: inline-block; }
+.line { width: 16px; border-top: 2px solid #94a3b8; display: inline-block; }
+.line.dashed { border-top: 2px dashed #3b82f6; }
+
+.map { flex: 1; min-height: 0; }
+
+.exceptions {
+    background: #fff;
+    border-top: 1px solid #e2e8f0;
+    padding: 8px 16px;
+}
+.alert-row {
+    display: flex;
+    gap: 8px;
+    overflow-x: auto;
+    min-height: 40px;
+    align-items: center;
+    margin-top: 4px;
+}
+.alert {
+    flex-shrink: 0;
+    border: none;
+    border-left: 4px solid;
+    border-radius: 4px;
+    padding: 8px 12px;
+    text-align: left;
+    cursor: pointer;
+    font: inherit;
+}
+.alert.red { border-color: #dc2626; background: #fef2f2; }
+.alert.amber { border-color: #f59e0b; background: #fffbeb; }

@@ -1,0 +1,644 @@
+@page "/dispatch"
+@layout Dispatch.Web.Components.Layout.BoardLayout
+@rendermode @(new InteractiveServerRenderMode(prerender: false))
+@attribute [Authorize(Roles = Roles.DispatchStaff)]
+@implements IAsyncDisposable
+
+@using System.Security.Claims
+@using Dispatch.Shared
+@using Dispatch.Web.Data
+@using Dispatch.Web.Services
+@using Dispatch.Web.Services.Routing
+@using Dispatch.Web.Components.Dispatch
+@using Microsoft.AspNetCore.Authorization
+
+@inject BoardQueries Queries
+@inject DispatchService Dispatch
+@inject DispatchEvents Events
+@inject PresenceTracker Presence
+@inject SelectionSync SelectionSync
+@inject RoutePlanningService Planning
+@inject DispatchClock Clock
+@inject IJSRuntime JS
+
+<PageTitle>Dispatch</PageTitle>
+
+<div class="board" tabindex="0" @ref="rootRef" @onkeydown="OnKeyDownAsync">
+    <header class="topbar">
+        <span class="brand">Dispatch</span>
+        <span class="dim">@Clock.LocalNow.ToString("ddd, MMM d")</span>
+
+        <select @bind="zoneFilter" @onfocus="() => typing = true" @onblur="() => typing = false">
+            <option value="0">All zones</option>
+            @foreach (var z in snapshot.Zones)
+            {
+                <option value="@z.Id">@z.Name</option>
+            }
+        </select>
+
+        <input class="search" placeholder="Search jobs…"
+               @bind="search" @bind:event="oninput"
+               @onfocus="() => typing = true" @onblur="() => typing = false" />
+
+        <button class="btn primary" @onclick="() => showNewJob = true">+ New job</button>
+        <button class="btn" @onclick="() => showImport = true">Upload CSV</button>
+        <button class="btn" @onclick="OpenMapAsync">🗺 Open map</button>
+        <button class="btn" @onclick="() => showPlan = true">🧭 Plan day</button>
+        <a class="btn" href="/dispatch/people">👥 People</a>
+        <a class="btn" href="/dispatch/clients">🏢 Clients</a>
+        <a class="btn" href="/dispatch/settings">⚙ Settings</a>
+
+        @if (AlertCount > 0)
+        {
+            <span class="alert-pill">@AlertCount alerts</span>
+        }
+
+        <div class="avatars">
+            @foreach (var p in Presence.Online)
+            {
+                <span class="avatar @(p.UserId == me.UserId ? "me" : "")" title="@p.Name">@Initial(p.Name)</span>
+            }
+        </div>
+    </header>
+
+    <main class="columns">
+        @* ---------- Left: queue / needs attention / delivered today ---------- *@
+        <section class="col">
+            <div class="tabs">
+                <button class="@(leftTab == "queue" ? "on" : "")" @onclick="@(() => leftTab = "queue")">Unassigned (@queue.Count)</button>
+                <button class="@(leftTab == "attention" ? "on" : "")" @onclick="@(() => leftTab = "attention")">
+                    Needs attention
+                    @if (attention.Count > 0) { <span class="count-pill">@attention.Count</span> }
+                </button>
+                <button class="@(leftTab == "delivered" ? "on" : "")" @onclick="@(() => leftTab = "delivered")">Delivered today (@delivered.Count)</button>
+            </div>
+
+            <div class="list">
+                @if (leftTab == "queue")
+                {
+                    @foreach (var job in queue)
+                    {
+                        var viewers = ViewersOf(job.Id);
+                        <div class="card job @AgeClass(job) @(job.Id == selectedJobId ? "selected" : "")"
+                             draggable="true"
+                             @ondragstart="() => draggedJobId = job.Id"
+                             @onclick="() => SelectJob(job.Id)">
+                            <div class="row">
+                                <strong>@job.Ref · @job.DisplayName</strong>
+                                <span class="row-end">
+                                    @if (job.Type == JobType.OnDemand)
+                                    {
+                                        <span class="mono">@FormatAge(nowUtc - job.CreatedAt)</span>
+                                    }
+                                    <button class="info" title="Details" @onclick="() => detailJobId = job.Id" @onclick:stopPropagation>ⓘ</button>
+                                </span>
+                            </div>
+                            <div class="dim">@job.Pickup?.Address → @job.Dropoff?.Address</div>
+                            <div class="row small">
+                                <span>@WindowLabel(job) · @ZoneName(job.ZoneId)</span>
+                                @if (viewers.Count > 0)
+                                {
+                                    <span class="viewing">👁 @string.Join(", ", viewers) viewing</span>
+                                }
+                            </div>
+                        </div>
+                    }
+                    @if (queue.Count == 0) { <p class="empty">Queue is clear 🎉</p> }
+                }
+                else if (leftTab == "attention")
+                {
+                    @foreach (var a in attention)
+                    {
+                        <div class="card failed" @onclick="() => detailJobId = a.JobId">
+                            <div class="row">
+                                <strong>@a.Ref · @a.DisplayName</strong>
+                                <span class="dim small">@(a.FailedAt is { } f ? Clock.ToLocal(f).ToString("MMM d, h:mm tt") : "")</span>
+                            </div>
+                            <div class="fail-text">✕ @(a.FailedKind == StopKind.Pickup ? "Pickup" : "Delivery") failed: @(a.Reason ?? "no reason given")</div>
+                            <div class="dim small">@a.Address · @(a.DriverName ?? "No driver")</div>
+                        </div>
+                    }
+                    @if (attention.Count == 0) { <p class="empty">Nothing needs attention 👍</p> }
+                }
+                else
+                {
+                    @foreach (var d in delivered)
+                    {
+                        <div class="card" @onclick="() => detailJobId = d.JobId">
+                            <div class="row">
+                                <strong>@d.Ref · @d.DisplayName</strong>
+                                <span class="dim small">@Clock.ToLocal(d.CompletedAt).ToString("h:mm tt")</span>
+                            </div>
+                            <div class="dim">@d.Address</div>
+                            <div class="dim small">
+                                @d.DriverName
+                                @if (d.HasPhoto || d.HasSignature)
+                                {
+                                    <span> · @(d.HasPhoto ? "📷" : "")@(d.HasSignature ? " ✍️" : "")@(d.ReceivedBy is null ? "" : $" · {d.ReceivedBy}")</span>
+                                }
+                                else
+                                {
+                                    <span class="no-proof"> · no proof</span>
+                                }
+                            </div>
+                        </div>
+                    }
+                    @if (delivered.Count == 0) { <p class="empty">No deliveries yet today</p> }
+                }
+            </div>
+
+            @if (leftTab == "queue")
+            {
+                <p class="hint">↑/↓ select · A assign · N new job · ⓘ details · or drag onto a driver</p>
+            }
+        </section>
+
+        @* ---------- Middle: drivers ---------- *@
+        <section class="col">
+            <h2>Drivers (@visibleDrivers.Count)</h2>
+            <div class="list">
+                @foreach (var d in visibleDrivers)
+                {
+                    var stale = IsStale(d);
+                    var next = NextStopFor(d.Id);
+                    <div class="card driver @(d.Id == selectedDriverId ? "selected" : "")"
+                         @onclick="() => SelectDriver(d.Id)"
+                         @ondragover:preventDefault
+                         @ondrop="() => DropOnDriverAsync(d.Id)">
+                        <div class="row">
+                            <strong>@d.Name</strong>
+                            <span class="status @d.Status.ToString().ToLowerInvariant()">@d.Status</span>
+                        </div>
+                        <div class="dim small">
+                            @(next is null ? "No pending stops" : $"Next: {next.Address}") · @ActiveJobCount(d.Id) jobs
+                        </div>
+                        <div class="small @(stale ? "stale" : "dim")">
+                            @(stale ? "⚠ " : "")@(d.LastPingAt is { } ping ? $"GPS {FormatAge(nowUtc - ping)} ago" : "No GPS yet")
+                        </div>
+                    </div>
+                }
+            </div>
+        </section>
+
+        @* ---------- Right: route panel ---------- *@
+        <section class="col" @ondragover:preventDefault @ondrop="() => DropOnDriverAsync(selectedDriverId)">
+            <div class="route-head">
+                <h2>Today's route · @(SelectedDriver?.Name ?? "Select a driver")</h2>
+                @if (OpenStopCount >= 2)
+                {
+                    <button class="btn primary small" disabled="@optimizing" @onclick="OptimizeSelectedAsync">
+                        @(optimizing ? "Optimizing…" : "⚡ Optimize")
+                    </button>
+                }
+            </div>
+            @if (SelectedDriver is not null && routeStops.Count == 0)
+            {
+                <div class="dropzone">Drop jobs here to assign</div>
+            }
+            <ol class="list route">
+                @for (var i = 0; i < routeStops.Count; i++)
+                {
+                    var index = i;
+                    var rs = routeStops[i];
+                    <li class="card stop">
+                        <span class="seq @rs.Stop.Status.ToString().ToLowerInvariant()">@SeqLabel(rs.Stop, index)</span>
+                        <div class="grow">
+                            <strong>
+                                @(rs.Stop.Kind == StopKind.Pickup ? "↑ Pickup" : "↓ Dropoff") ·
+                                <button class="ref-link" @onclick="() => detailJobId = rs.Job.Id" @onclick:stopPropagation>@rs.Job.Ref</button>
+                            </strong>
+                            <div class="dim small">@rs.Stop.Address</div>
+                            @if (rs.Stop.Eta is { } eta && rs.Stop.Status is StopStatus.Pending or StopStatus.Arrived)
+                            {
+                                <div class="small eta">ETA @Clock.ToLocal(eta).ToString("h:mm tt")</div>
+                            }
+                            <div class="small stop-status @rs.Stop.Status.ToString().ToLowerInvariant()">@rs.Stop.Status</div>
+                        </div>
+                        <div class="arrows">
+                            <button @onclick="() => MoveStopAsync(index, -1)" @onclick:stopPropagation>▲</button>
+                            <button @onclick="() => MoveStopAsync(index, 1)" @onclick:stopPropagation>▼</button>
+                        </div>
+                        @if (rs.Job.Status == JobStatus.Assigned)
+                        {
+                            <button class="unassign" title="Return to queue"
+                                    @onclick="() => UnassignAsync(rs.Job)" @onclick:stopPropagation>✕</button>
+                        }
+                    </li>
+                }
+            </ol>
+        </section>
+    </main>
+
+    @if (showNewJob)
+    {
+        <NewJobDialog Zones="snapshot.Zones" DefaultZoneId="defaultZoneId" Actor="me"
+                      OnClose="CloseDialogs" OnCreated="OnJobCreatedAsync" />
+    }
+    @if (showImport)
+    {
+        <CsvImportDialog Zones="snapshot.Zones" DefaultZoneId="defaultZoneId" Actor="me"
+                         OnClose="CloseDialogs" OnImported="OnImportedAsync" />
+    }
+    @if (showPlan)
+    {
+        <PlanDayDialog ZoneId="@(zoneFilter == 0 ? null : zoneFilter)" ZoneName="@(zoneFilter == 0 ? "All zones" : ZoneName(zoneFilter))"
+                       Actor="me" OnClose="CloseDialogs" />
+    }
+    @if (detailJobId is int detailId)
+    {
+        <JobDetailDialog JobId="detailId" Actor="me" OnClose="CloseDialogs" />
+    }
+
+    @if (toast is not null)
+    {
+        <div class="toast @(toast.Warn ? "warn" : "")">@toast.Message</div>
+    }
+</div>
+
+@code {
+    [CascadingParameter] private Task<AuthenticationState> AuthState { get; set; } = default!;
+
+    private sealed record Toast(string Message, bool Warn);
+
+    private BoardSnapshot snapshot = BoardSnapshot.Empty;
+    private Actor me = new("", "");
+    private readonly Guid presenceKey = Guid.NewGuid();
+
+    private int zoneFilter;
+    private int? defaultZoneId;
+    private string search = "";
+    private bool typing;
+    private string leftTab = "queue";
+    private int? selectedJobId;
+    private int? selectedDriverId;
+    private int? draggedJobId;
+    private int? detailJobId;
+    private bool showNewJob;
+    private bool showImport;
+    private bool showPlan;
+    private bool optimizing;
+    private DateTimeOffset nowUtc = DateTimeOffset.UtcNow;
+
+    private Toast? toast;
+    private CancellationTokenSource? toastCts;
+    private CancellationTokenSource? reloadCts;
+    private Timer? ticker;
+    private ElementReference rootRef;
+    private bool focused;
+
+    // Recomputed each render
+    private List<JobVm> queue = [];
+    private List<DriverVm> visibleDrivers = [];
+    private List<RouteStopVm> routeStops = [];
+    private List<AttentionVm> attention = [];
+    private List<DeliveredVm> delivered = [];
+
+    private DriverVm? SelectedDriver => snapshot.Drivers.FirstOrDefault(d => d.Id == selectedDriverId);
+    private RouteVm? TodayRoute => snapshot.Routes.FirstOrDefault(r => r.DriverId == selectedDriverId);
+    private int OpenStopCount => routeStops.Count(rs => rs.Stop.Status is StopStatus.Pending or StopStatus.Arrived);
+
+    // ---------- Lifecycle ----------
+
+    protected override async Task OnInitializedAsync()
+    {
+        var user = (await AuthState).User;
+        var userId = user.FindFirstValue(ClaimTypes.NameIdentifier)!;
+        var profile = await Queries.GetProfileAsync(userId);
+
+        me = new Actor(userId, profile.FullName);
+        zoneFilter = profile.ZoneId ?? 0;
+        defaultZoneId = profile.ZoneId;
+        snapshot = await Queries.LoadAsync();
+
+        var shared = SelectionSync.Get(me.UserId);
+        selectedDriverId = shared.DriverId ?? snapshot.Drivers.FirstOrDefault()?.Id;
+        selectedJobId = shared.JobId;
+        SelectionSync.SetDriver(me.UserId, selectedDriverId);
+
+        Events.Changed += OnDispatchChanged;
+        Presence.Changed += OnPresenceChanged;
+        SelectionSync.Changed += OnSelectionChanged;
+        Presence.Set(presenceKey, new PresenceEntry(me.UserId, me.Name, selectedJobId));
+
+        // Refresh age timers and "GPS 30s ago" labels
+        ticker = new Timer(_ => _ = InvokeAsync(() =>
+        {
+            nowUtc = DateTimeOffset.UtcNow;
+            StateHasChanged();
+        }), null, 5000, 5000);
+    }
+
+    protected override void OnParametersSet() => Recompute();
+
+    protected override bool ShouldRender()
+    {
+        Recompute();
+        return true;
+    }
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (!focused)
+        {
+            focused = true;
+            await rootRef.FocusAsync();   // so keyboard shortcuts work immediately
+        }
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        Events.Changed -= OnDispatchChanged;
+        Presence.Changed -= OnPresenceChanged;
+        SelectionSync.Changed -= OnSelectionChanged;
+        Presence.Remove(presenceKey);
+        reloadCts?.Cancel();
+        toastCts?.Cancel();
+        if (ticker is not null) await ticker.DisposeAsync();
+    }
+
+    // ---------- Live updates ----------
+
+    private Task OnDispatchChanged(DispatchChange change) => InvokeAsync(() =>
+    {
+        if (change.Kind is ChangeKind.Drivers or ChangeKind.Locations)
+        {
+            _ = ReloadDriversAsync();
+            return;
+        }
+        // Debounce bursts (one assignment touches several rows)
+        reloadCts?.Cancel();
+        reloadCts = new CancellationTokenSource();
+        _ = DebouncedReloadAsync(reloadCts.Token);
+    });
+
+    private void OnPresenceChanged() => _ = InvokeAsync(StateHasChanged);
+
+    private void OnSelectionChanged(string userId, SelectionState state)
+    {
+        if (userId != me.UserId) return;
+        _ = InvokeAsync(() =>
+        {
+            if (state.DriverId == selectedDriverId && state.JobId == selectedJobId) return;
+            selectedDriverId = state.DriverId;
+            selectedJobId = state.JobId;
+            Presence.Set(presenceKey, new PresenceEntry(me.UserId, me.Name, state.JobId));
+            StateHasChanged();
+        });
+    }
+
+    private async Task DebouncedReloadAsync(CancellationToken token)
+    {
+        try { await Task.Delay(250, token); }
+        catch (TaskCanceledException) { return; }
+        snapshot = await Queries.LoadAsync();
+        StateHasChanged();
+    }
+
+    private async Task ReloadDriversAsync()
+    {
+        var drivers = await Queries.LoadDriversAsync();
+        snapshot = snapshot with { Drivers = drivers };
+        StateHasChanged();
+    }
+
+    // ---------- Derived data ----------
+
+    private void Recompute()
+    {
+        var q = search.Trim();
+        bool Matches(JobVm j) =>
+            q.Length == 0 ||
+            j.Ref.Contains(q, StringComparison.OrdinalIgnoreCase) ||
+            j.DisplayName.Contains(q, StringComparison.OrdinalIgnoreCase) ||
+            j.Stops.Any(s => s.Address.Contains(q, StringComparison.OrdinalIgnoreCase));
+        bool MatchesText(params string?[] values) =>
+            q.Length == 0 || values.Any(v => v?.Contains(q, StringComparison.OrdinalIgnoreCase) == true);
+
+        var unassigned = snapshot.Jobs.Where(j => j.Status == JobStatus.Unassigned && InZone(j.ZoneId) && Matches(j)).ToList();
+        queue =
+        [
+            .. unassigned.Where(j => j.Type == JobType.OnDemand).OrderBy(j => j.CreatedAt),
+            .. unassigned.Where(j => j.Type == JobType.Scheduled).OrderBy(j => j.WindowStart ?? DateTimeOffset.MaxValue),
+        ];
+
+        visibleDrivers = snapshot.Drivers.Where(d => InZone(d.ZoneId)).ToList();
+
+        var route = TodayRoute;
+        routeStops = route is null
+            ? []
+            : snapshot.Jobs
+                .SelectMany(j => j.Stops.Where(s => s.RouteId == route.Id).Select(s => new RouteStopVm(s, j)))
+                .OrderBy(rs => rs.Stop.Sequence)
+                .ToList();
+
+        attention = snapshot.Attention.Where(a => InZone(a.ZoneId) && MatchesText(a.Ref, a.DisplayName, a.Address)).ToList();
+        delivered = snapshot.Delivered.Where(d => InZone(d.ZoneId) && MatchesText(d.Ref, d.DisplayName, d.Address)).ToList();
+    }
+
+    private bool InZone(int? zoneId) => zoneFilter == 0 || zoneId == zoneFilter;
+
+    private StopVm? NextStopFor(int driverId)
+    {
+        var route = snapshot.Routes.FirstOrDefault(r => r.DriverId == driverId);
+        if (route is null) return null;
+        return snapshot.Jobs
+            .SelectMany(j => j.Stops)
+            .Where(s => s.RouteId == route.Id && (s.Status == StopStatus.Pending || s.Status == StopStatus.Arrived))
+            .OrderBy(s => s.Sequence)
+            .FirstOrDefault();
+    }
+
+    private int ActiveJobCount(int driverId) =>
+        snapshot.Jobs.Count(j => j.DriverId == driverId && (j.Status == JobStatus.Assigned || j.Status == JobStatus.InProgress));
+
+    private bool IsStale(DriverVm d) =>
+        d.Status != DriverStatus.Offline && (d.LastPingAt is null || nowUtc - d.LastPingAt.Value > TimeSpan.FromMinutes(5));
+
+    private int AlertCount =>
+        attention.Count
+        + snapshot.Jobs.Count(j => InZone(j.ZoneId) && j.Status == JobStatus.Unassigned && j.Type == JobType.OnDemand
+                                   && nowUtc - j.CreatedAt > TimeSpan.FromMinutes(30))
+        + visibleDrivers.Count(IsStale);
+
+    private List<string> ViewersOf(int jobId) =>
+        Presence.All
+            .Where(p => p.UserId != me.UserId && p.ViewingJobId == jobId)
+            .Select(p => p.Name.Split(' ')[0])
+            .Distinct()
+            .ToList();
+
+    // ---------- Actions ----------
+
+    private void SelectJob(int jobId)
+    {
+        selectedJobId = jobId;
+        Presence.Set(presenceKey, new PresenceEntry(me.UserId, me.Name, jobId));
+        SelectionSync.SetJob(me.UserId, jobId);
+    }
+
+    private void SelectDriver(int driverId)
+    {
+        selectedDriverId = driverId;
+        SelectionSync.SetDriver(me.UserId, driverId);
+    }
+
+    private async Task DropOnDriverAsync(int? driverId)
+    {
+        if (draggedJobId is int jobId && driverId is int d) await AssignAsync(jobId, d);
+        draggedJobId = null;
+    }
+
+    private async Task AssignAsync(int jobId, int driverId)
+    {
+        var job = snapshot.Jobs.FirstOrDefault(j => j.Id == jobId);
+        var driver = snapshot.Drivers.FirstOrDefault(d => d.Id == driverId);
+
+        var result = await Dispatch.AssignAsync(jobId, driverId, me);
+        if (result.Success)
+        {
+            ShowToast($"{job?.Ref} assigned to {driver?.Name}");
+            selectedJobId = null;
+            Presence.Set(presenceKey, new PresenceEntry(me.UserId, me.Name, null));
+            SelectionSync.SetJob(me.UserId, null);
+        }
+        else
+        {
+            ShowToast(result.Error!, warn: true);
+        }
+        snapshot = await Queries.LoadAsync();
+    }
+
+    private async Task UnassignAsync(JobVm job)
+    {
+        var result = await Dispatch.UnassignAsync(job.Id, me);
+        ShowToast(result.Success ? $"{job.Ref} returned to queue" : result.Error!, warn: !result.Success);
+        snapshot = await Queries.LoadAsync();
+    }
+
+    private async Task MoveStopAsync(int index, int direction)
+    {
+        if (TodayRoute is not { } route) return;
+        var ids = routeStops.Select(rs => rs.Stop.Id).ToList();
+        var target = index + direction;
+        if (target < 0 || target >= ids.Count) return;
+        (ids[index], ids[target]) = (ids[target], ids[index]);
+
+        var result = await Dispatch.ReorderRouteAsync(route.Id, ids);
+        if (!result.Success) ShowToast(result.Error!, warn: true);
+        snapshot = await Queries.LoadAsync();
+    }
+
+    private async Task OptimizeSelectedAsync()
+    {
+        if (selectedDriverId is not int driverId) return;
+        optimizing = true;
+        var result = await Planning.OptimizeDriverAsync(driverId);
+        optimizing = false;
+
+        if (!result.Success)
+        {
+            ShowToast(result.Error!, warn: true);
+            return;
+        }
+        var s = result.Value!;
+        var finish = s.FinishEta is { } f ? $", finishing around {Clock.ToLocal(f):h:mm tt}" : "";
+        var warning = s.CouldNotFit > 0 ? $" {s.CouldNotFit} stop(s) couldn't meet their windows and were left at the end." : "";
+        ShowToast($"Route optimized: {s.Stops} stops{finish}.{warning}", warn: s.CouldNotFit > 0);
+        snapshot = await Queries.LoadAsync();
+    }
+
+    private async Task OpenMapAsync() =>
+        await JS.InvokeVoidAsync("open", "/dispatch/map", "dispatch-map", "popup,width=1400,height=900");
+
+    private void CloseDialogs()
+    {
+        showNewJob = false;
+        showImport = false;
+        showPlan = false;
+        detailJobId = null;
+        focused = false;   // refocus the board so keyboard shortcuts work again
+    }
+
+    private async Task OnJobCreatedAsync(Job job)
+    {
+        ShowToast($"{job.Ref} created");
+        snapshot = await Queries.LoadAsync();
+        SelectJob(job.Id);   // press A to assign it straight away
+    }
+
+    private async Task OnImportedAsync(ImportResult result)
+    {
+        ShowToast($"Imported {result.Created} jobs{(result.Skipped > 0 ? $", skipped {result.Skipped} duplicates" : "")}");
+        snapshot = await Queries.LoadAsync();
+    }
+
+    private async Task OnKeyDownAsync(KeyboardEventArgs e)
+    {
+        if (typing || showNewJob || showImport || showPlan || detailJobId is not null) return;
+        var idx = queue.FindIndex(j => j.Id == selectedJobId);
+
+        switch (e.Key)
+        {
+            case "ArrowDown" when queue.Count > 0:
+                SelectJob(queue[Math.Min(idx + 1, queue.Count - 1)].Id);
+                break;
+            case "ArrowUp" when queue.Count > 0:
+                SelectJob(queue[Math.Max(idx - 1, 0)].Id);
+                break;
+            case "a" or "A" when selectedJobId is int j && selectedDriverId is int d:
+                await AssignAsync(j, d);
+                break;
+            case "n" or "N":
+                showNewJob = true;
+                break;
+        }
+    }
+
+    private void ShowToast(string message, bool warn = false)
+    {
+        toastCts?.Cancel();
+        toastCts = new CancellationTokenSource();
+        var token = toastCts.Token;
+        toast = new Toast(message, warn);
+        _ = Task.Delay(3500, token).ContinueWith(t =>
+        {
+            if (!t.IsCanceled) _ = InvokeAsync(() => { toast = null; StateHasChanged(); });
+        }, TaskScheduler.Default);
+    }
+
+    // ---------- Formatting ----------
+
+    private static string FormatAge(TimeSpan span)
+    {
+        if (span < TimeSpan.Zero) span = TimeSpan.Zero;
+        if (span.TotalMinutes < 1) return $"{(int)span.TotalSeconds}s";
+        if (span.TotalMinutes < 60) return $"{(int)span.TotalMinutes}m";
+        return $"{(int)span.TotalHours}h {span.Minutes}m";
+    }
+
+    private string AgeClass(JobVm job)
+    {
+        if (job.Type != JobType.OnDemand) return "";
+        var minutes = (nowUtc - job.CreatedAt).TotalMinutes;
+        return minutes > 30 ? "age-red" : minutes > 15 ? "age-amber" : "";
+    }
+
+    private string WindowLabel(JobVm job)
+    {
+        if (job.Type == JobType.OnDemand) return "⚡ ASAP";
+        if (job.WindowStart is { } ws && job.WindowEnd is { } we)
+            return $"🕒 {Clock.ToLocal(ws):h:mm tt}–{Clock.ToLocal(we):h:mm tt}";
+        return $"🕒 {job.ScheduledDate:MMM d}";
+    }
+
+    private string ZoneName(int? zoneId) => snapshot.Zones.FirstOrDefault(z => z.Id == zoneId)?.Name ?? "No zone";
+
+    private static string SeqLabel(StopVm stop, int index) => stop.Status switch
+    {
+        StopStatus.Completed => "✓",
+        StopStatus.Failed => "✕",
+        _ => (index + 1).ToString(),
+    };
+
+    private static string Initial(string name) => string.IsNullOrEmpty(name) ? "?" : name[..1].ToUpperInvariant();
+}

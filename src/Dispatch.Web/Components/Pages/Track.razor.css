@@ -1,0 +1,61 @@
+.track {
+    min-height: 100vh;
+    max-width: 520px;
+    margin: 0 auto;
+    padding: 0 16px 24px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    background: #f8fafc;
+    color: #0f172a;
+    font: 16px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+header {
+    padding: 16px 0 4px;
+    font-weight: 700;
+    font-size: 18px;
+}
+
+.center { text-align: center; padding: 40px 0; color: #64748b; }
+
+.card {
+    background: #fff;
+    border: 1px solid #e2e8f0;
+    border-radius: 14px;
+    padding: 20px;
+}
+.card h1 { font-size: 22px; margin: 0 0 8px; }
+.card p { margin: 6px 0; }
+.dim { color: #64748b; font-size: 14px; }
+
+.eta { color: #1d4ed8; font-weight: 600; }
+.eta.big { font-size: 20px; }
+
+.photo { width: 100%; border-radius: 10px; margin-top: 10px; }
+
+.progress {
+    display: flex;
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    gap: 6px;
+}
+.progress li {
+    flex: 1;
+    text-align: center;
+    font-size: 13px;
+    color: #94a3b8;
+    padding-top: 10px;
+    border-top: 4px solid #e2e8f0;
+}
+.progress li.done { color: #16a34a; border-top-color: #16a34a; font-weight: 600; }
+
+.map {
+    height: 300px;
+    border-radius: 14px;
+    overflow: hidden;
+    border: 1px solid #e2e8f0;
+}
+
+footer { color: #64748b; font-size: 14px; text-align: center; margin-top: 8px; }

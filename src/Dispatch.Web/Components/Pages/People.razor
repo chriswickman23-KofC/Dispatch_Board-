@@ -1,0 +1,375 @@
+@page "/dispatch/people"
+@layout Dispatch.Web.Components.Layout.BoardLayout
+@rendermode @(new InteractiveServerRenderMode(prerender: false))
+@attribute [Authorize(Roles = Roles.DispatchStaff)]
+
+@using System.Security.Claims
+@using Dispatch.Shared
+@using Dispatch.Web.Services
+@using Microsoft.AspNetCore.Authorization
+
+@inject PeopleService People
+@inject NavigationManager Nav
+
+<PageTitle>People · Dispatch</PageTitle>
+
+<div class="admin">
+    <header class="topbar">
+        <a class="back" href="/dispatch">‹ Board</a>
+        <span class="brand">People</span>
+        <div class="actions">
+            <button class="btn primary" @onclick="() => OpenForm(FormMode.InviteDriver)">+ Invite driver</button>
+            <button class="btn" @onclick="() => OpenForm(FormMode.InviteStaff)">+ Invite dispatcher</button>
+        </div>
+    </header>
+
+    <main class="content">
+        @if (message is not null)
+        {
+            <div class="message @(messageIsError ? "error" : "")">
+                @message
+                <button class="close" @onclick="() => message = null">✕</button>
+            </div>
+        }
+
+        <div class="tabs">
+            <button class="@(tab == "drivers" ? "on" : "")" @onclick="@(() => tab = "drivers")">Drivers (@data.Drivers.Count)</button>
+            <button class="@(tab == "staff" ? "on" : "")" @onclick="@(() => tab = "staff")">Dispatch staff (@data.Staff.Count)</button>
+            <label class="show-inactive">
+                <input type="checkbox" @bind="showInactive" /> Show deactivated
+            </label>
+        </div>
+
+        @if (tab == "drivers")
+        {
+            <table class="grid">
+                <thead>
+                    <tr><th>Name</th><th>App login</th><th>Phone</th><th>Zone</th><th>Status</th><th></th></tr>
+                </thead>
+                <tbody>
+                    @foreach (var d in data.Drivers.Where(d => showInactive || d.State != PersonState.Deactivated))
+                    {
+                        <tr class="@(d.State == PersonState.Deactivated ? "inactive" : "")">
+                            <td><strong>@d.Name</strong></td>
+                            <td>@(d.Email ?? "—")</td>
+                            <td>@(d.Phone ?? "—")</td>
+                            <td>@ZoneName(d.ZoneId)</td>
+                            <td>
+                                <span class="badge @StateClass(d.State)">@StateText(d.State)</span>
+                                @if (d.State == PersonState.Active && d.Status != DriverStatus.Offline)
+                                {
+                                    <span class="badge onshift">on shift</span>
+                                }
+                            </td>
+                            <td class="row-actions">
+                                <button @onclick="() => OpenEditDriver(d)">Edit</button>
+                                @switch (d.State)
+                                {
+                                    case PersonState.NoLogin:
+                                        <button @onclick="() => OpenLinkDriver(d)">Send app invite</button>
+                                        break;
+                                    case PersonState.Invited:
+                                        <button disabled="@busy" @onclick="() => SendPasswordEmailAsync(d.UserId!)">Resend invite</button>
+                                        break;
+                                    case PersonState.Active:
+                                        <button disabled="@busy" @onclick="() => SendPasswordEmailAsync(d.UserId!)">Reset password</button>
+                                        break;
+                                }
+                                @if (d.State == PersonState.Deactivated)
+                                {
+                                    <button disabled="@busy" @onclick="() => SetDriverActiveAsync(d, true)">Reactivate</button>
+                                }
+                                else
+                                {
+                                    <button class="danger" @onclick="() => confirm = new Confirmation(d.Name, d.ActiveJobs, () => SetDriverActiveAsync(d, false))">Deactivate</button>
+                                }
+                            </td>
+                        </tr>
+                    }
+                </tbody>
+            </table>
+        }
+        else
+        {
+            <table class="grid">
+                <thead>
+                    <tr><th>Name</th><th>Email</th><th>Role</th><th>Default zone</th><th>Status</th><th></th></tr>
+                </thead>
+                <tbody>
+                    @foreach (var s in data.Staff.Where(s => showInactive || s.State != PersonState.Deactivated))
+                    {
+                        var locked = s.Role == Roles.Admin && !me.IsAdmin;
+                        var isMe = s.UserId == me.UserId;
+                        <tr class="@(s.State == PersonState.Deactivated ? "inactive" : "")">
+                            <td><strong>@s.Name</strong>@if (isMe) { <span class="dim"> (you)</span> }</td>
+                            <td>@s.Email</td>
+                            <td>@s.Role</td>
+                            <td>@ZoneName(s.ZoneId)</td>
+                            <td><span class="badge @StateClass(s.State)">@StateText(s.State)</span></td>
+                            <td class="row-actions">
+                                @if (locked)
+                                {
+                                    <span class="dim">Admin-managed</span>
+                                }
+                                else
+                                {
+                                    <button @onclick="() => OpenEditStaff(s)">Edit</button>
+                                    @if (s.State == PersonState.Invited)
+                                    {
+                                        <button disabled="@busy" @onclick="() => SendPasswordEmailAsync(s.UserId)">Resend invite</button>
+                                    }
+                                    else if (s.State == PersonState.Active)
+                                    {
+                                        <button disabled="@busy" @onclick="() => SendPasswordEmailAsync(s.UserId)">Reset password</button>
+                                    }
+                                    @if (!isMe)
+                                    {
+                                        @if (s.State == PersonState.Deactivated)
+                                        {
+                                            <button disabled="@busy" @onclick="() => SetStaffActiveAsync(s, true)">Reactivate</button>
+                                        }
+                                        else
+                                        {
+                                            <button class="danger" @onclick="() => confirm = new Confirmation(s.Name, 0, () => SetStaffActiveAsync(s, false))">Deactivate</button>
+                                        }
+                                    }
+                                }
+                            </td>
+                        </tr>
+                    }
+                </tbody>
+            </table>
+        }
+    </main>
+</div>
+
+@if (form is not null)
+{
+    <div class="dd-backdrop" @onmousedown="() => form = null">
+        <div class="dd-dialog" @onmousedown:stopPropagation>
+            <div class="dd-head">
+                <h2>@FormTitle</h2>
+                <button class="dd-x" @onclick="() => form = null">✕</button>
+            </div>
+
+            <label class="dd-full">Name <input @bind="form.Name" /></label>
+
+            @if (form.Mode is FormMode.InviteDriver or FormMode.LinkDriver or FormMode.InviteStaff)
+            {
+                <label class="dd-full">Email <input type="email" @bind="form.Email" autocomplete="off" /></label>
+            }
+
+            <div class="dd-grid">
+                @if (form.Mode is FormMode.InviteDriver or FormMode.LinkDriver or FormMode.EditDriver)
+                {
+                    <label>Phone <input type="tel" @bind="form.Phone" /></label>
+                }
+                else
+                {
+                    <label>Role
+                        <select @bind="form.Role">
+                            <option value="@Roles.Dispatcher">Dispatcher</option>
+                            @if (me.IsAdmin)
+                            {
+                                <option value="@Roles.Admin">Admin</option>
+                            }
+                        </select>
+                    </label>
+                }
+                <label>@(form.Mode is FormMode.InviteStaff or FormMode.EditStaff ? "Default board zone" : "Zone")
+                    <select @bind="form.ZoneId">
+                        <option value="">@(form.Mode is FormMode.InviteStaff or FormMode.EditStaff ? "All zones" : "No zone")</option>
+                        @foreach (var z in data.Zones)
+                        {
+                            <option value="@z.Id">@z.Name</option>
+                        }
+                    </select>
+                </label>
+            </div>
+
+            @if (form.Mode is FormMode.InviteDriver or FormMode.LinkDriver or FormMode.InviteStaff)
+            {
+                <p class="dd-note">They'll get an email with a link to set their password. The link expires in 3 days.</p>
+            }
+
+            @if (formError is not null)
+            {
+                <p class="dd-error">@formError</p>
+            }
+
+            <div class="dd-actions">
+                <button class="dd-btn" @onclick="() => form = null">Cancel</button>
+                <button class="dd-btn primary" disabled="@busy" @onclick="SubmitFormAsync">@(busy ? "Saving…" : SubmitText)</button>
+            </div>
+        </div>
+    </div>
+}
+
+@if (confirm is not null)
+{
+    <div class="dd-backdrop" @onmousedown="() => confirm = null">
+        <div class="dd-dialog" @onmousedown:stopPropagation>
+            <div class="dd-head"><h2>Deactivate @confirm.Name?</h2></div>
+            @if (confirm.ActiveJobs > 0)
+            {
+                <p class="dd-error">@confirm.Name has @confirm.ActiveJobs active job(s). Reassign them on the board first.</p>
+                <div class="dd-actions"><button class="dd-btn" @onclick="() => confirm = null">OK</button></div>
+            }
+            else
+            {
+                <p>They'll be signed out and won't be able to sign in until reactivated. Their delivery history is kept.</p>
+                <div class="dd-actions">
+                    <button class="dd-btn" @onclick="() => confirm = null">Cancel</button>
+                    <button class="dd-btn danger" disabled="@busy" @onclick="RunConfirmationAsync">Deactivate</button>
+                </div>
+            }
+        </div>
+    </div>
+}
+
+@code {
+    [CascadingParameter] private Task<AuthenticationState> AuthState { get; set; } = default!;
+
+    private enum FormMode { InviteDriver, LinkDriver, EditDriver, InviteStaff, EditStaff }
+
+    private sealed class PersonForm
+    {
+        public FormMode Mode { get; init; }
+        public int? DriverId { get; init; }
+        public string? UserId { get; init; }
+        public string Name { get; set; } = "";
+        public string Email { get; set; } = "";
+        public string? Phone { get; set; }
+        public int? ZoneId { get; set; }
+        public string Role { get; set; } = Roles.Dispatcher;
+    }
+
+    private sealed record Confirmation(string Name, int ActiveJobs, Func<Task> Action);
+
+    private PeopleSnapshot data = PeopleSnapshot.Empty;
+    private PeopleActor me = new("", false);
+    private string tab = "drivers";
+    private bool showInactive;
+    private bool busy;
+    private string? message;
+    private bool messageIsError;
+    private PersonForm? form;
+    private string? formError;
+    private Confirmation? confirm;
+
+    protected override async Task OnInitializedAsync()
+    {
+        var user = (await AuthState).User;
+        me = new PeopleActor(user.FindFirstValue(ClaimTypes.NameIdentifier)!, user.IsInRole(Roles.Admin));
+        data = await People.LoadAsync();
+    }
+
+    private void OpenForm(FormMode mode)
+    {
+        form = new PersonForm { Mode = mode };
+        formError = null;
+    }
+
+    private void OpenLinkDriver(DriverPersonVm d)
+    {
+        form = new PersonForm { Mode = FormMode.LinkDriver, DriverId = d.DriverId, Name = d.Name, Phone = d.Phone, ZoneId = d.ZoneId };
+        formError = null;
+    }
+
+    private void OpenEditDriver(DriverPersonVm d)
+    {
+        form = new PersonForm { Mode = FormMode.EditDriver, DriverId = d.DriverId, Name = d.Name, Phone = d.Phone, ZoneId = d.ZoneId };
+        formError = null;
+    }
+
+    private void OpenEditStaff(StaffVm s)
+    {
+        form = new PersonForm { Mode = FormMode.EditStaff, UserId = s.UserId, Name = s.Name, ZoneId = s.ZoneId, Role = s.Role };
+        formError = null;
+    }
+
+    private string FormTitle => form?.Mode switch
+    {
+        FormMode.InviteDriver => "Invite a driver",
+        FormMode.LinkDriver => $"Send {form.Name} an app invite",
+        FormMode.EditDriver => "Edit driver",
+        FormMode.InviteStaff => "Invite dispatch staff",
+        _ => "Edit dispatch staff",
+    };
+
+    private string SubmitText => form?.Mode is FormMode.EditDriver or FormMode.EditStaff ? "Save" : "Send invite";
+
+    private async Task SubmitFormAsync()
+    {
+        if (form is null) return;
+        busy = true;
+        formError = null;
+
+        var result = form.Mode switch
+        {
+            FormMode.InviteDriver => await People.InviteDriverAsync(null, form.Name, form.Email, form.Phone, form.ZoneId, Nav.BaseUri),
+            FormMode.LinkDriver => await People.InviteDriverAsync(form.DriverId, form.Name, form.Email, form.Phone, form.ZoneId, Nav.BaseUri),
+            FormMode.EditDriver => await People.UpdateDriverAsync(form.DriverId!.Value, form.Name, form.Phone, form.ZoneId),
+            FormMode.InviteStaff => await People.InviteStaffAsync(form.Name, form.Email, form.Role, form.ZoneId, me, Nav.BaseUri),
+            _ => await People.UpdateStaffAsync(form.UserId!, form.Name, form.ZoneId, form.Role, me),
+        };
+
+        busy = false;
+        if (!result.Success)
+        {
+            formError = result.Error;
+            return;
+        }
+        form = null;
+        await ReloadAsync(result.Value!);
+    }
+
+    private Task SendPasswordEmailAsync(string userId) =>
+        RunAsync(() => People.SendPasswordEmailAsync(userId, me, Nav.BaseUri));
+
+    private Task SetDriverActiveAsync(DriverPersonVm d, bool active) =>
+        RunAsync(() => People.SetDriverActiveAsync(d.DriverId, active));
+
+    private Task SetStaffActiveAsync(StaffVm s, bool active) =>
+        RunAsync(() => People.SetStaffActiveAsync(s.UserId, active, me));
+
+    private async Task RunConfirmationAsync()
+    {
+        var action = confirm!.Action;
+        confirm = null;
+        await action();
+    }
+
+    private async Task RunAsync(Func<Task<Result<string>>> action)
+    {
+        busy = true;
+        var result = await action();
+        busy = false;
+        if (result.Success) await ReloadAsync(result.Value!);
+        else ShowMessage(result.Error!, isError: true);
+    }
+
+    private async Task ReloadAsync(string successMessage)
+    {
+        data = await People.LoadAsync();
+        ShowMessage(successMessage, isError: successMessage.Contains("couldn't"));
+    }
+
+    private void ShowMessage(string text, bool isError)
+    {
+        message = text;
+        messageIsError = isError;
+    }
+
+    private string ZoneName(int? zoneId) => data.Zones.FirstOrDefault(z => z.Id == zoneId)?.Name ?? "—";
+
+    private static string StateText(PersonState state) => state switch
+    {
+        PersonState.Active => "Active",
+        PersonState.Invited => "Invite pending",
+        PersonState.Deactivated => "Deactivated",
+        _ => "No app login",
+    };
+
+    private static string StateClass(PersonState state) => state.ToString().ToLowerInvariant();
+}

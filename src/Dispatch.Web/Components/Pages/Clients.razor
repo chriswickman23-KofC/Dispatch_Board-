@@ -1,0 +1,320 @@
+@page "/dispatch/clients"
+@layout Dispatch.Web.Components.Layout.BoardLayout
+@rendermode @(new InteractiveServerRenderMode(prerender: false))
+@attribute [Authorize(Roles = Roles.DispatchStaff)]
+
+@using Dispatch.Shared
+@using Dispatch.Web.Services
+@using Dispatch.Web.Components.Dispatch
+@using Microsoft.AspNetCore.Authorization
+
+@inject ClientService Clients
+@inject PeopleService People
+@inject DispatchClock Clock
+
+<PageTitle>Clients · Dispatch</PageTitle>
+
+<div class="admin">
+    <header class="topbar">
+        <a class="back" href="/dispatch">‹ Board</a>
+        <span class="brand">Clients</span>
+        <div class="actions">
+            <select @bind="days" @bind:after="LoadAsync">
+                <option value="7">Last 7 days</option>
+                <option value="30">Last 30 days</option>
+                <option value="90">Last 90 days</option>
+            </select>
+            <button class="btn primary" @onclick="OpenNew">+ Add client</button>
+        </div>
+    </header>
+
+    <main class="content">
+        @if (message is not null)
+        {
+            <div class="message @(messageIsError ? "error" : "")">
+                @message
+                <button class="close" @onclick="() => message = null">✕</button>
+            </div>
+        }
+
+        @if (rows is null)
+        {
+            <p class="dim">Loading…</p>
+        }
+        else
+        {
+            var active = rows.Where(r => r.Active).ToList();
+            var delivered = active.Sum(r => r.Stats.Delivered);
+            var withWindow = active.Sum(r => r.Stats.WithWindow);
+            var onTime = active.Sum(r => r.Stats.OnTime);
+            var failed = active.Sum(r => r.Stats.FailedAttempts);
+            double? overallOnTime = withWindow == 0 ? null : (double)onTime / withWindow;
+
+            <div class="summary">
+                <div class="tile"><span class="num">@delivered</span><span class="label">delivered</span></div>
+                <div class="tile">
+                    <span class="num @RateClass(overallOnTime)">@Percent(overallOnTime)</span>
+                    <span class="label">on time (jobs with a window)</span>
+                </div>
+                <div class="tile"><span class="num">@failed</span><span class="label">failed attempts</span></div>
+                <div class="tile"><span class="num">@active.Count</span><span class="label">active clients</span></div>
+            </div>
+
+            <div class="filters">
+                <input class="search" placeholder="Search clients…" @bind="search" @bind:event="oninput" />
+                <label><input type="checkbox" @bind="showInactive" /> Show inactive</label>
+            </div>
+
+            <table class="grid clickable">
+                <thead>
+                    <tr>
+                        <th>Client</th>
+                        <th>Contact</th>
+                        <th>Default pickup</th>
+                        <th class="num">Delivered</th>
+                        <th class="num">On time</th>
+                        <th class="num">Failed</th>
+                        <th class="num">Avg on-demand</th>
+                        <th class="num">Open now</th>
+                        <th>Last delivery</th>
+                        <th>Texts</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    @foreach (var r in VisibleRows)
+                    {
+                        <tr class="@(r.Active ? "" : "inactive")" @onclick="() => OpenEditAsync(r.Id)">
+                            <td>
+                                <strong>@r.Name</strong>
+                                @if (!r.Active) { <span class="badge deactivated">inactive</span> }
+                                @if (r.HasCsvLayout) { <span class="badge csv" title="Saved CSV column layout">CSV</span> }
+                            </td>
+                            <td>
+                                @(r.ContactName ?? "—")
+                                @if (r.ContactPhone is not null) { <div class="dim small">@r.ContactPhone</div> }
+                            </td>
+                            <td>@(r.DefaultPickupAddress ?? "—")</td>
+                            <td class="num">@r.Stats.Delivered</td>
+                            <td class="num @RateClass(r.Stats.OnTimeRate)">@Percent(r.Stats.OnTimeRate)</td>
+                            <td class="num @(r.Stats.FailedAttempts > 0 ? "warn" : "")">@r.Stats.FailedAttempts</td>
+                            <td class="num">@Minutes(r.Stats.AvgOnDemandMinutes)</td>
+                            <td class="num">@r.Stats.OpenNow</td>
+                            <td>@(r.Stats.LastDeliveredAt is { } last ? Clock.ToLocal(last).ToString("MMM d") : "—")</td>
+                            <td>@(r.SendCustomerTexts ? "On" : "Off")</td>
+                        </tr>
+                    }
+                    @if (!VisibleRows.Any())
+                    {
+                        <tr><td colspan="10" class="dim">No clients match.</td></tr>
+                    }
+                </tbody>
+            </table>
+        }
+    </main>
+</div>
+
+@if (form is not null)
+{
+    <div class="dd-backdrop" @onmousedown="CloseForm">
+        <div class="dd-dialog dd-wide" @onmousedown:stopPropagation>
+            <div class="dd-head">
+                <h2>@(form.Id is null ? "Add client" : form.Name)</h2>
+                <button class="dd-x" @onclick="CloseForm">✕</button>
+            </div>
+
+            <div class="dd-body client-grid">
+                <div class="client-form">
+                    <label class="dd-full">Client name <input @bind="form.Name" /></label>
+
+                    <div class="dd-grid">
+                        <label>Contact name <input @bind="form.ContactName" /></label>
+                        <label>Contact phone <input type="tel" @bind="form.ContactPhone" /></label>
+                    </div>
+                    <label class="dd-full">Contact email <input type="email" @bind="form.ContactEmail" /></label>
+
+                    <AddressAutocomplete @key="@($"pickup-{form.Id}")" Label="Default pickup address"
+                                         Placeholder="Where drivers usually collect this client's orders"
+                                         @bind-Value="form.DefaultPickup" />
+
+                    <label class="check">
+                        <input type="checkbox" @bind="form.SendCustomerTexts" />
+                        Text this client's customers delivery updates
+                    </label>
+                    <p class="dd-note">Turn this off for clients who notify their own customers.</p>
+
+                    <label class="dd-full">Notes <textarea rows="2" @bind="form.Notes" placeholder="Loading dock hours, contact preferences…"></textarea></label>
+
+                    @if (form.Id is not null)
+                    {
+                        <label class="check">
+                            <input type="checkbox" @bind="form.Active" />
+                            Active (inactive clients are hidden from new jobs and CSV imports)
+                        </label>
+
+                        @if (form.CsvColumnCount > 0)
+                        {
+                            <div class="csv-row">
+                                <span>Saved CSV layout: @form.CsvColumnCount columns matched</span>
+                                <button class="dd-link" @onclick="ResetCsvAsync">Reset</button>
+                            </div>
+                        }
+                    }
+
+                    @if (formError is not null)
+                    {
+                        <p class="dd-error">@formError</p>
+                    }
+                </div>
+
+                @if (form.Id is int clientId && rows?.FirstOrDefault(r => r.Id == clientId) is { } row)
+                {
+                    <div class="client-stats">
+                        <span class="jd-label">Last @days days</span>
+                        <dl>
+                            <dt>Delivered</dt><dd>@row.Stats.Delivered</dd>
+                            <dt>On time</dt><dd class="@RateClass(row.Stats.OnTimeRate)">@Percent(row.Stats.OnTimeRate) <span class="dim">(@row.Stats.OnTime of @row.Stats.WithWindow with a window)</span></dd>
+                            <dt>Failed attempts</dt><dd>@row.Stats.FailedAttempts <span class="dim">(@Percent(row.Stats.FailureRate) of attempts)</span></dd>
+                            <dt>Avg on-demand time</dt><dd>@Minutes(row.Stats.AvgOnDemandMinutes)</dd>
+                            <dt>Open now</dt><dd>@row.Stats.OpenNow</dd>
+                        </dl>
+
+                        <span class="jd-label">Why deliveries failed</span>
+                        @if (reasons is null)
+                        {
+                            <p class="dim">Loading…</p>
+                        }
+                        else if (reasons.Count == 0)
+                        {
+                            <p class="dim">No failed attempts in this period.</p>
+                        }
+                        else
+                        {
+                            var max = reasons.Max(x => x.Count);
+                            <ul class="reasons">
+                                @foreach (var reason in reasons)
+                                {
+                                    <li>
+                                        <span class="reason-name">@reason.Reason</span>
+                                        <span class="bar"><span style="width:@(reason.Count * 100 / max)%"></span></span>
+                                        <span class="reason-count">@reason.Count</span>
+                                    </li>
+                                }
+                            </ul>
+                        }
+                    </div>
+                }
+            </div>
+
+            @if (form.Id is int integrationsClientId)
+            {
+                <div class="dd-body">
+                    <ClientIntegrationsPanel ClientId="integrationsClientId" Zones="zones" />
+                </div>
+            }
+
+            <div class="dd-actions">
+                <button class="dd-btn" @onclick="CloseForm">Cancel</button>
+                <button class="dd-btn primary" disabled="@saving" @onclick="SaveAsync">@(saving ? "Saving…" : "Save")</button>
+            </div>
+        </div>
+    </div>
+}
+
+@code {
+    private List<ClientRowVm>? rows;
+    private IReadOnlyList<ZoneVm> zones = [];
+    private int days = 30;
+    private string search = "";
+    private bool showInactive;
+    private string? message;
+    private bool messageIsError;
+
+    private ClientForm? form;
+    private List<FailureReasonCount>? reasons;
+    private string? formError;
+    private bool saving;
+
+    private IEnumerable<ClientRowVm> VisibleRows =>
+        (rows ?? [])
+            .Where(r => showInactive || r.Active)
+            .Where(r => search.Trim().Length == 0
+                        || r.Name.Contains(search.Trim(), StringComparison.OrdinalIgnoreCase)
+                        || (r.ContactName?.Contains(search.Trim(), StringComparison.OrdinalIgnoreCase) ?? false));
+
+    protected override Task OnInitializedAsync() => LoadAsync();
+
+    private async Task LoadAsync()
+    {
+        zones = (await People.LoadAsync()).Zones;
+        rows = await Clients.GetAllWithStatsAsync(days);
+        if (form?.Id is int id) reasons = await Clients.GetFailureReasonsAsync(id, days);
+    }
+
+    private void OpenNew()
+    {
+        form = new ClientForm();
+        reasons = null;
+        formError = null;
+    }
+
+    private async Task OpenEditAsync(int clientId)
+    {
+        formError = null;
+        reasons = null;
+        form = await Clients.GetFormAsync(clientId);
+        if (form is not null) reasons = await Clients.GetFailureReasonsAsync(clientId, days);
+    }
+
+    private void CloseForm()
+    {
+        form = null;
+        reasons = null;
+    }
+
+    private async Task SaveAsync()
+    {
+        if (form is null) return;
+        saving = true;
+        formError = null;
+        var result = await Clients.SaveAsync(form);
+        saving = false;
+
+        if (!result.Success)
+        {
+            formError = result.Error;
+            return;
+        }
+        CloseForm();
+        await LoadAsync();
+        message = result.Value;
+        messageIsError = false;
+    }
+
+    private async Task ResetCsvAsync()
+    {
+        if (form?.Id is not int id) return;
+        await Clients.ResetCsvMappingAsync(id);
+        form.CsvColumnCount = 0;
+        await LoadAsync();
+        message = "Saved CSV layout cleared. Their next import will start with fresh column guesses.";
+        messageIsError = false;
+    }
+
+    private static string Percent(double? rate) => rate is { } r ? $"{r:0%}" : "—";
+
+    private static string Minutes(double? minutes) => minutes switch
+    {
+        null => "—",
+        < 60 => $"{minutes:0} min",
+        _ => $"{(int)(minutes / 60)}h {(int)(minutes % 60)}m",
+    };
+
+    /// <summary>Highlights on-time rates below 90% (amber) and 75% (red).</summary>
+    private static string RateClass(double? rate) => rate switch
+    {
+        null => "",
+        < 0.75 => "bad",
+        < 0.90 => "warn",
+        _ => "good",
+    };
+}

@@ -1,0 +1,189 @@
+@page "/track/{Token}"
+@layout Dispatch.Web.Components.Layout.BoardLayout
+@rendermode @(new InteractiveServerRenderMode(prerender: false))
+@implements IAsyncDisposable
+
+@using Dispatch.Web.Services
+@using Dispatch.Web.Services.Notifications
+
+@inject TrackingService Tracking
+@inject DispatchEvents Events
+@inject DispatchClock Clock
+@inject IJSRuntime JS
+
+<PageTitle>Delivery tracking</PageTitle>
+<HeadContent><meta name="robots" content="noindex" /></HeadContent>
+
+<div class="track">
+    <header>@(vm?.Company ?? "")</header>
+
+    @if (loading)
+    {
+        <p class="center">Loading…</p>
+    }
+    else if (vm is null)
+    {
+        <div class="card">
+            <h1>Link not found</h1>
+            <p>This tracking link isn't valid. Please check the link in your text message.</p>
+        </div>
+    }
+    else
+    {
+        @if (vm.Stage is not (TrackingStage.Expired or TrackingStage.NotDelivered))
+        {
+            <ol class="progress">
+                <li class="done">Scheduled</li>
+                <li class="@(vm.Stage is TrackingStage.OnTheWay or TrackingStage.Delivered ? "done" : "")">On the way</li>
+                <li class="@(vm.Stage == TrackingStage.Delivered ? "done" : "")">Delivered</li>
+            </ol>
+        }
+
+        <div class="card">
+            @switch (vm.Stage)
+            {
+                case TrackingStage.Scheduled:
+                    <h1>Your delivery is scheduled</h1>
+                    <p>@ScheduledText(vm)</p>
+                    break;
+
+                case TrackingStage.WithDriver:
+                    <h1>Your delivery is on @(vm.DriverFirstName ?? "our driver")'s route</h1>
+                    <p>@vm.StopsBefore stop@(vm.StopsBefore == 1 ? "" : "s") before yours.</p>
+                    @if (vm.Eta is { } eta)
+                    {
+                        <p class="eta">Estimated arrival @CustomerMessages.Around(Clock.ToLocal(eta))</p>
+                    }
+                    break;
+
+                case TrackingStage.OnTheWay:
+                    <h1>@(vm.DriverFirstName ?? "Your driver") is on the way</h1>
+                    @if (vm.Eta is { } onTheWayEta)
+                    {
+                        <p class="eta big">Arriving @CustomerMessages.Around(Clock.ToLocal(onTheWayEta))</p>
+                    }
+                    <p class="dim">This page updates automatically.</p>
+                    break;
+
+                case TrackingStage.Delivered:
+                    <h1>Delivered</h1>
+                    <p>@(vm.DeliveredAt is { } at ? $"Delivered at {Clock.ToLocal(at):h:mm tt} on {Clock.ToLocal(at):dddd, MMM d}." : "")</p>
+                    @if (vm.ReceivedBy is not null)
+                    {
+                        <p>Received by @vm.ReceivedBy</p>
+                    }
+                    @if (vm.HasPhoto)
+                    {
+                        <img class="photo" src="/track/@Token/photo" alt="Photo of your delivery" />
+                    }
+                    break;
+
+                case TrackingStage.NotDelivered:
+                    <h1>We couldn't complete your delivery</h1>
+                    @if (vm.Problem is not null)
+                    {
+                        <p>Our driver reported that @vm.Problem.</p>
+                    }
+                    <p>@(vm.From ?? "The sender") will be in touch to reschedule.</p>
+                    break;
+
+                default:
+                    <h1>This tracking link has expired</h1>
+                    <p>For questions about this order, please contact @(vm.From ?? "the sender").</p>
+                    break;
+            }
+        </div>
+
+        @if (ShowMap)
+        {
+            <div class="map" @ref="mapElement"></div>
+        }
+
+        @if (vm.From is not null)
+        {
+            <footer>Questions about your order? Contact @vm.From.</footer>
+        }
+    }
+</div>
+
+@code {
+    [Parameter] public string Token { get; set; } = "";
+
+    private TrackingVm? vm;
+    private bool loading = true;
+    private ElementReference mapElement;
+    private IJSObjectReference? module;
+    private bool mapReady;
+
+    private bool ShowMap => vm is { Stage: TrackingStage.OnTheWay, DriverPosition: not null };
+
+    protected override async Task OnInitializedAsync()
+    {
+        vm = await Tracking.LoadAsync(Token);
+        loading = false;
+        Events.Changed += OnChanged;
+    }
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (ShowMap && !mapReady)
+        {
+            module ??= await JS.InvokeAsync<IJSObjectReference>("import", "./js/trackMap.js");
+            await module.InvokeVoidAsync("init", mapElement,
+                new { lat = vm!.Destination.Lat, lng = vm.Destination.Lng },
+                new { lat = vm.DriverPosition!.Lat, lng = vm.DriverPosition.Lng });
+            mapReady = true;
+        }
+        else if (ShowMap && mapReady)
+        {
+            await module!.InvokeVoidAsync("update", new { lat = vm!.DriverPosition!.Lat, lng = vm.DriverPosition.Lng });
+        }
+        else if (!ShowMap && mapReady)
+        {
+            await module!.InvokeVoidAsync("dispose");   // the map element was removed (e.g. just delivered)
+            mapReady = false;
+        }
+    }
+
+    private Task OnChanged(DispatchChange change)
+    {
+        if (vm is null) return Task.CompletedTask;
+
+        var relevant = change.Kind switch
+        {
+            ChangeKind.Jobs => change.JobId == vm.JobId || (change.DriverId is not null && change.DriverId == vm.DriverId),
+            ChangeKind.Etas or ChangeKind.Locations => change.DriverId is not null && change.DriverId == vm.DriverId,
+            _ => false,
+        };
+
+        return relevant
+            ? InvokeAsync(async () =>
+            {
+                vm = await Tracking.LoadAsync(Token);
+                StateHasChanged();
+            })
+            : Task.CompletedTask;
+    }
+
+    private string ScheduledText(TrackingVm v)
+    {
+        var day = v.ScheduledDate is { } d && d != Clock.Today ? $"on {d:dddd, MMM d}" : "today";
+        return v.WindowStart is { } ws && v.WindowEnd is { } we
+            ? $"Expected {day} between {Clock.ToLocal(ws):h:mm tt} and {Clock.ToLocal(we):h:mm tt}."
+            : $"Expected {day}. We'll text you when it's on the way.";
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        Events.Changed -= OnChanged;
+        if (module is not null)
+        {
+            try
+            {
+                if (mapReady) await module.InvokeVoidAsync("dispose");
+                await module.DisposeAsync();
+            }
+            catch (JSDisconnectedException) { /* customer closed the page */ }
+        }
+    }
+}

@@ -1,0 +1,263 @@
+@using Dispatch.Shared
+@using Dispatch.Web.Services
+@using Dispatch.Web.Services.Calendar
+@inject JobDetailService Details
+@inject DispatchService Dispatch
+@inject DispatchEvents Events
+@inject DeliveryCalendar Calendar
+@inject DispatchClock Clock
+@implements IDisposable
+
+<div class="dd-backdrop" @onmousedown="Close">
+    <div class="dd-dialog dd-wide" tabindex="0" @ref="root" @onmousedown:stopPropagation @onkeydown="OnKeyDownAsync">
+        <div class="dd-head">
+            @if (job is null)
+            {
+                <span class="dim">@(notFound ? "This job no longer exists." : "Loading…")</span>
+            }
+            else
+            {
+                <div class="jd-title">
+                    <h2>@job.Ref</h2>
+                    <span class="jd-badge @BadgeClass(job)">@StatusText(job)</span>
+                    <span class="dim">@job.DisplayName</span>
+                </div>
+            }
+            <button class="dd-x" @onclick="Close">✕</button>
+        </div>
+
+        @if (job is not null)
+        {
+            <div class="dd-body jd-grid">
+                @* ---------- Left: job, stops, proof ---------- *@
+                <div class="jd-main">
+                    <div class="jd-info">
+                        @if (job.RecipientName is not null) { <div>Recipient: @job.RecipientName</div> }
+                        @if (job.RecipientPhone is not null) { <div>Phone: @job.RecipientPhone</div> }
+                        <div>@WhenText(job)</div>
+                        @if (job.DriverName is not null) { <div>Driver: @job.DriverName</div> }
+                        @if (job.Notes is not null) { <div class="jd-notes">📝 @job.Notes</div> }
+                    </div>
+
+                    @foreach (var s in job.Stops)
+                    {
+                        <div class="jd-stop">
+                            <div class="dd-row">
+                                <strong>@(s.Kind == StopKind.Pickup ? "↑ Pickup" : "↓ Dropoff"): @s.Address</strong>
+                                <span class="jd-stop-status @s.Status.ToString().ToLowerInvariant()">@s.Status</span>
+                            </div>
+                            <div class="dim small">
+                                @if (s.ArrivedAt is { } a) { <span>Arrived @Local(a)</span> }
+                                @if (s.ArrivedAt is not null && s.CompletedAt is not null) { <span> · </span> }
+                                @if (s.CompletedAt is { } c) { <span>@(s.Status == StopStatus.Failed ? "Failed" : "Completed") @Local(c)</span> }
+                            </div>
+                            @if (s.FailureReason is not null)
+                            {
+                                <div class="bad">✕ @s.FailureReason</div>
+                            }
+
+                            @foreach (var p in s.Proofs)
+                            {
+                                <div class="jd-proof">
+                                    @if (p.PhotoUrl is not null)
+                                    {
+                                        <img class="jd-photo" src="@p.PhotoUrl" alt="Delivery photo" @onclick="() => zoomUrl = p.PhotoUrl" />
+                                    }
+                                    <div>
+                                        @if (p.SignatureUrl is not null)
+                                        {
+                                            <img class="jd-signature" src="@p.SignatureUrl" alt="Signature" @onclick="() => zoomUrl = p.SignatureUrl" />
+                                        }
+                                        @if (p.RecipientName is not null) { <div>Received by @p.RecipientName</div> }
+                                        <div class="dim small">Captured @Local(p.CapturedAt)</div>
+                                    </div>
+                                </div>
+                            }
+                            @if (s.Kind == StopKind.Dropoff && s.Status == StopStatus.Completed && s.Proofs.Count == 0)
+                            {
+                                <div class="warn small">No proof of delivery recorded</div>
+                            }
+                        </div>
+                    }
+                </div>
+
+                @* ---------- Right: actions and history ---------- *@
+                <div class="jd-side">
+                    @if (message is not null)
+                    {
+                        <div class="jd-message @(messageIsError ? "error" : "")">@message</div>
+                    }
+
+                    @if (job.NeedsReview)
+                    {
+                        <div class="jd-attention">
+                            <strong>Needs attention</strong>
+                            <div class="bad">
+                                @(job.FailedStop?.Kind == StopKind.Pickup ? "Pickup" : "Delivery") failed:
+                                @(job.FailedStop?.FailureReason ?? "no reason given")
+                            </div>
+
+                            <div class="jd-action">
+                                <span class="jd-label">Reschedule</span>
+                                <input type="date" min="@Clock.Today.ToString("yyyy-MM-dd")" @bind="rescheduleDate" @bind:after="CheckRescheduleDateAsync" />
+                                @if (rescheduleWarning is not null)
+                                {
+                                    <p class="dd-warn">⚠ @rescheduleWarning</p>
+                                }
+                                <input placeholder="Note (optional), e.g. customer asked for Tuesday" @bind="rescheduleNote" />
+                                <button class="dd-btn primary" disabled="@busy" @onclick="RescheduleAsync">Reschedule</button>
+                            </div>
+
+                            <div class="jd-action divider">
+                                <span class="jd-label">Or close without retrying</span>
+                                <textarea rows="2" placeholder="Why? e.g. refused, client notified" @bind="closeNote" @bind:event="oninput"></textarea>
+                                <button class="dd-btn" disabled="@(busy || string.IsNullOrWhiteSpace(closeNote))" @onclick="CloseJobAsync">Close with note</button>
+                            </div>
+                        </div>
+                    }
+
+                    <div class="jd-action">
+                        <span class="jd-label">Add a note for the record</span>
+                        <textarea rows="2" placeholder="e.g. Called client, confirmed new address" @bind="note" @bind:event="oninput"></textarea>
+                        <button class="dd-btn outline" disabled="@(busy || string.IsNullOrWhiteSpace(note))" @onclick="AddNoteAsync">Add note</button>
+                    </div>
+
+                    <div>
+                        <span class="jd-label">History</span>
+                        <ol class="jd-history">
+                            @foreach (var e in job.Events)
+                            {
+                                <li class="@HistoryClass(e)">
+                                    <div>@e.Description</div>
+                                    <div class="dim small">@Local(e.At) · @e.ActorName</div>
+                                </li>
+                            }
+                        </ol>
+                    </div>
+                </div>
+            </div>
+        }
+    </div>
+
+    @if (zoomUrl is not null)
+    {
+        <div class="jd-zoom" @onmousedown="() => zoomUrl = null" @onmousedown:stopPropagation>
+            <img src="@zoomUrl" alt="Proof enlarged" />
+        </div>
+    }
+</div>
+
+@code {
+    [Parameter] public int JobId { get; set; }
+    [Parameter, EditorRequired] public Actor Actor { get; set; } = default!;
+    [Parameter] public EventCallback OnClose { get; set; }
+
+    private JobDetailVm? job;
+    private bool notFound;
+    private bool busy;
+    private string? message;
+    private bool messageIsError;
+    private string? zoomUrl;
+    private DateOnly rescheduleDate;
+    private string? rescheduleWarning;
+    private string? rescheduleNote;
+    private string? closeNote;
+    private string? note;
+    private ElementReference root;
+    private bool focused;
+
+    protected override async Task OnInitializedAsync()
+    {
+        rescheduleDate = await Calendar.NextOpenDayAsync(Clock.Today);
+        Events.Changed += OnDispatchChanged;
+        await LoadAsync();
+    }
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (!focused)
+        {
+            focused = true;
+            await root.FocusAsync();   // so Escape closes the panel
+        }
+    }
+
+    private async Task LoadAsync()
+    {
+        job = await Details.LoadAsync(JobId);
+        notFound = job is null;
+    }
+
+    private Task OnDispatchChanged(DispatchChange change) =>
+        (change.Kind == ChangeKind.Jobs && (change.JobId is null || change.JobId == JobId)) || change.Kind == ChangeKind.Etas
+            ? InvokeAsync(async () => { await LoadAsync(); StateHasChanged(); })
+            : Task.CompletedTask;
+
+    private async Task CheckRescheduleDateAsync() =>
+        rescheduleWarning = await Calendar.ClosedReasonAsync(rescheduleDate) is { } reason
+            ? $"{rescheduleDate:dddd, MMM d}: {reason}."
+            : null;
+
+    private async Task RescheduleAsync()
+    {
+        await RunAsync(() => Dispatch.RescheduleFailedJobAsync(JobId, rescheduleDate, rescheduleNote, Actor),
+            $"Rescheduled to {rescheduleDate:MMM d}. It's back in the Unassigned queue for that day.");
+        rescheduleNote = null;
+    }
+
+    private async Task CloseJobAsync()
+    {
+        await RunAsync(() => Dispatch.CloseFailedJobAsync(JobId, closeNote ?? "", Actor), "Job closed.");
+        closeNote = null;
+    }
+
+    private async Task AddNoteAsync()
+    {
+        await RunAsync(() => Dispatch.AddNoteAsync(JobId, note ?? "", Actor), "Note added.");
+        note = null;
+    }
+
+    private async Task RunAsync(Func<Task<Result>> action, string success)
+    {
+        busy = true;
+        var result = await action();
+        busy = false;
+        message = result.Success ? success : result.Error;
+        messageIsError = !result.Success;
+        await LoadAsync();
+    }
+
+    private async Task OnKeyDownAsync(KeyboardEventArgs e)
+    {
+        if (e.Key != "Escape") return;
+        if (zoomUrl is not null) zoomUrl = null;
+        else await Close();
+    }
+
+    private Task Close() => OnClose.InvokeAsync();
+
+    private string Local(DateTimeOffset t) => Clock.ToLocal(t).ToString("MMM d, h:mm tt");
+
+    private string WhenText(JobDetailVm j)
+    {
+        if (j.Type == JobType.OnDemand) return "On-demand (ASAP)";
+        var day = j.ScheduledDate?.ToString("MMM d") ?? "";
+        return j.WindowStart is { } ws && j.WindowEnd is { } we
+            ? $"Scheduled {day} · {Clock.ToLocal(ws):h:mm tt}–{Clock.ToLocal(we):h:mm tt}"
+            : $"Scheduled {day}";
+    }
+
+    private static string StatusText(JobDetailVm j) =>
+        j.Status == JobStatus.Failed && j.Reviewed ? "failed · closed" : j.Status switch
+        {
+            JobStatus.InProgress => "in progress",
+            _ => j.Status.ToString().ToLowerInvariant(),
+        };
+
+    private static string BadgeClass(JobDetailVm j) => j.Status.ToString().ToLowerInvariant();
+
+    private static string HistoryClass(EventVm e) =>
+        e.Action == "stop_failed" ? "bad" : e.Action == "note" ? "note" : "";
+
+    public void Dispose() => Events.Changed -= OnDispatchChanged;
+}
