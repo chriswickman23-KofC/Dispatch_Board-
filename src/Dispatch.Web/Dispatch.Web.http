@@ -1,0 +1,46 @@
+@host = https://localhost:7001
+@token = paste-access-token-here
+
+### Log in as the test driver
+POST {{host}}/api/driver/auth/login
+Content-Type: application/json
+
+{ "email": "driver@yourco.com", "password": "your-dev-driver-password" }
+
+### Who am I?
+GET {{host}}/api/driver/me
+Authorization: Bearer {{token}}
+
+### Clock in (watch the driver turn green on the board)
+POST {{host}}/api/driver/clock-in
+Authorization: Bearer {{token}}
+
+### Today's route
+GET {{host}}/api/driver/route
+Authorization: Bearer {{token}}
+
+### Send a GPS point (update recordedAt to within the last day)
+POST {{host}}/api/driver/locations
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+[{ "lat": 38.8850, "lng": -77.1000, "accuracy": 8, "recordedAt": "2026-10-26T15:00:00Z" }]
+
+### Mark a stop as arrived (use a stop id from the route response)
+POST {{host}}/api/driver/stops/1/status
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{ "status": "Arrived" }
+
+### Order API (create a key on the Clients page first)
+POST {{host}}/api/intake/orders
+Authorization: Bearer dk_paste-your-key
+Content-Type: application/json
+
+{
+  "orderId": "1001",
+  "recipient": { "name": "Jane Doe", "phone": "703-555-0142" },
+  "dropoff": { "address": "1100 Wilson Blvd, Arlington, VA 22209" },
+  "notes": "Leave with the front desk"
+}

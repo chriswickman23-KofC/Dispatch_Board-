@@ -1,0 +1,26 @@
+# Build output
+bin/
+obj/
+publish/
+efbundle*
+*.zip
+
+# IDE
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+
+# Local data and secrets (never commit real credentials)
+App_Data/
+*.local.json
+.env
+*.pfx
+*.p12
+*.keystore
+*.mobileprovision
+
+# OS
+.DS_Store
+Thumbs.db
